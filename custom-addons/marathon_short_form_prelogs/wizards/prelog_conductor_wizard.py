@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from collections import defaultdict
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from html import escape
 
 from odoo import Command, _, api, fields, models
@@ -39,9 +39,27 @@ class MvPrelogConductorVersionOption(models.TransientModel):
     latest_upload_at = fields.Datetime(readonly=True)
 
 
+class MvPrelogConductorPreviewRecipient(models.TransientModel):
+    _name = "mv.prelog.conductor.preview.recipient"
+    _description = "Prelog Generator Recipient Preview"
+    _order = "sequence, id"
+
+    wizard_id = fields.Many2one(
+        "mv.prelog.conductor.wizard", required=True, ondelete="cascade", index=True
+    )
+    sequence = fields.Integer(default=10)
+    contact_id = fields.Many2one(
+        "res.partner", string="Contact", required=True, readonly=True
+    )
+    email = fields.Char(string="Email", readonly=True)
+    prelog_count = fields.Integer(string="Prelog Rows", readonly=True)
+    missing_email = fields.Boolean(readonly=True)
+
+
 class MvPrelogConductorWizard(models.TransientModel):
     _name = "mv.prelog.conductor.wizard"
     _description = "Prelog Generator"
+    _mv_related_tab_enabled = False
 
     network_id = fields.Many2one(
         "mv.programs",
@@ -73,15 +91,20 @@ class MvPrelogConductorWizard(models.TransientModel):
         related="version_option_id.version", string="Selected Version", readonly=True
     )
     matching_prelog_count = fields.Integer(
-        string="Matching Prelog Records", compute="_compute_preview"
+        string="Matching Prelog Records", readonly=True
     )
     contact_count = fields.Integer(
-        string="Contacts Receiving Workbooks", compute="_compute_preview"
+        string="Contacts Receiving Workbooks", readonly=True
     )
     missing_email_count = fields.Integer(
-        string="Contacts Missing Email", compute="_compute_preview"
+        string="Contacts Missing Email", readonly=True
     )
-    next_week_available = fields.Boolean(compute="_compute_next_week_available")
+    preview_recipient_ids = fields.One2many(
+        "mv.prelog.conductor.preview.recipient",
+        "wizard_id",
+        string="Recipients",
+        readonly=True,
+    )
 
     @api.model
     def action_open_conductor(self):
@@ -109,51 +132,52 @@ class MvPrelogConductorWizard(models.TransientModel):
             wizard.week_option_id = False
             wizard.version_option_id = False
             wizard._rebuild_week_options()
+            wizard._refresh_preview()
 
     @api.onchange("week_option_id")
     def _onchange_week_option_id(self):
         for wizard in self:
             wizard.version_option_id = False
             wizard._rebuild_version_options()
+            wizard._refresh_preview()
 
-    @api.depends("network_id", "week_option_id", "version_option_id")
-    def _compute_preview(self):
+    @api.onchange("version_option_id")
+    def _onchange_version_option_id(self):
         for wizard in self:
+            wizard._refresh_preview()
+
+    def _refresh_preview(self):
+        """Refresh counts and per-contact rows with one prelog query."""
+        for wizard in self:
+            grouped_counts = defaultdict(int)
+            contacts_by_id = {}
             prelogs = wizard._matching_prelogs()
-            contacts = prelogs.mapped("schedule.deal_parent.contact")
+            for prelog in prelogs:
+                contact = prelog.schedule.deal_parent.contact
+                grouped_counts[contact.id] += 1
+                contacts_by_id[contact.id] = contact
+
+            contacts = sorted(
+                contacts_by_id.values(),
+                key=lambda contact: (contact.display_name or "").casefold(),
+            )
             wizard.matching_prelog_count = len(prelogs)
             wizard.contact_count = len(contacts)
-            wizard.missing_email_count = len(
-                contacts.filtered(lambda contact: not (contact.email or "").strip())
+            wizard.missing_email_count = sum(
+                not bool((contact.email or "").strip()) for contact in contacts
             )
-
-    @api.depends("network_id")
-    def _compute_next_week_available(self):
-        for wizard in self:
-            if not wizard.network_id:
-                wizard.next_week_available = False
-                continue
-            next_week = wizard._business_week_start() + timedelta(days=7)
-            wizard.next_week_available = bool(
-                wizard._available_prelogs(week=next_week, limit=1)
-            )
-
-    def action_this_week(self):
-        self.ensure_one()
-        if not self.network_id:
-            raise UserError(_("Select a Network first."))
-        self._select_week(self._business_week_start(), allow_empty=True)
-        return self._form_action()
-
-    def action_next_week(self):
-        self.ensure_one()
-        if not self.network_id:
-            raise UserError(_("Select a Network first."))
-        next_week = self._business_week_start() + timedelta(days=7)
-        if not self._available_prelogs(week=next_week, limit=1):
-            raise UserError(_("No prelog records exist for this Network next week."))
-        self._select_week(next_week, allow_empty=False)
-        return self._form_action()
+            wizard.preview_recipient_ids = [Command.clear()] + [
+                Command.create(
+                    {
+                        "sequence": sequence,
+                        "contact_id": contact.id,
+                        "email": (contact.email or "").strip() or False,
+                        "prelog_count": grouped_counts[contact.id],
+                        "missing_email": not bool((contact.email or "").strip()),
+                    }
+                )
+                for sequence, contact in enumerate(contacts, start=1)
+            ]
 
     def action_prepare_emails(self):
         self.ensure_one()
@@ -211,6 +235,7 @@ class MvPrelogConductorWizard(models.TransientModel):
                 "contact_id": contact.id,
                 "account_id": account.id if account else False,
                 "email": email or False,
+                "email_cc": contact._prelog_conductor_email_cc(email),
                 "included": bool(email),
                 "prelog_ids": [Command.set(grouped_ids[contact.id])],
                 "prelog_count": len(grouped_ids[contact.id]),
@@ -347,27 +372,6 @@ class MvPrelogConductorWizard(models.TransientModel):
             ]
         )
 
-    def _select_week(self, week, *, allow_empty):
-        self.ensure_one()
-        option = self.week_option_ids.filtered(
-            lambda candidate: candidate.network_id == self.network_id
-            and candidate.week == week
-        )[:1]
-        if not option and allow_empty:
-            option = self.env["mv.prelog.conductor.week.option"].create(
-                {
-                    "name": format_date(self.env, week),
-                    "wizard_id": self.id,
-                    "network_id": self.network_id.id,
-                    "week": week,
-                    "has_data": False,
-                }
-            )
-        if not option:
-            raise UserError(_("No prelog records exist for the selected week."))
-        self.week_option_id = option
-        self._rebuild_version_options()
-
     def _matching_prelogs(self):
         self.ensure_one()
         if not self.network_id or not self.week_option_id or not self.version_option_id:
@@ -416,41 +420,6 @@ class MvPrelogConductorWizard(models.TransientModel):
         prelogs = self.env["mv.prelog_data"].search(domain, order="id")
         eligible = prelogs.filtered(self._has_active_contact_and_account)
         return eligible[:limit] if limit else eligible
-
-    def _available_prelogs(self, *, week=None, version=None, limit=None):
-        """Return uploaded rows used to populate Week and Version choices."""
-        self.ensure_one()
-        if not self.network_id:
-            return self.env["mv.prelog_data"]
-        domain = [
-            ("removed", "=", False),
-            "|",
-            ("import_job", "=", False),
-            ("import_job.state", "=", "completed"),
-        ]
-        if week:
-            domain += [
-                "|",
-                "&",
-                ("import_program", "=", self.network_id.id),
-                ("import_week_value", "=", week),
-                "&",
-                ("schedule.deal_parent.program", "=", self.network_id.id),
-                ("schedule.week", "=", week),
-            ]
-        else:
-            domain += [
-                "|",
-                ("import_program", "=", self.network_id.id),
-                ("schedule.deal_parent.program", "=", self.network_id.id),
-            ]
-        if version is not None:
-            domain.append(("version", "=", version))
-        return self.env["mv.prelog_data"].search(
-            domain,
-            order="id",
-            limit=limit,
-        )
 
     @staticmethod
     def _has_active_contact_and_account(prelog):
@@ -506,10 +475,6 @@ class MvPrelogConductorWizard(models.TransientModel):
             "<p>Please email us with any questions.</p>"
             "<p>Thanks!</p>"
         )
-
-    def _business_week_start(self):
-        today = fields.Date.context_today(self)
-        return today - timedelta(days=today.weekday())
 
     @api.constrains("network_id", "week_option_id", "version_option_id")
     def _check_options_belong_to_network(self):

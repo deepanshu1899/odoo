@@ -5,3 +5,14 @@
         pointer-events: auto;
     }
 }
+
+.o_prelog_send_progress_dialog {
+    .btn-close {
+        display: none;
+    }
+
+    .o_prelog_send_progress_bar {
+        height: 2rem;
+        font-size: 1rem;
+    }
+}

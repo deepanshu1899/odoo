@@ -6,11 +6,30 @@ from html import escape
 
 from odoo import Command, _, api, fields, models
 from odoo.exceptions import UserError
-from odoo.tools import format_date
+from odoo.tools import email_split, format_date
 
 from ..services.xlsx_renderer import render_short_form_workbook
 
 _logger = logging.getLogger(__name__)
+
+
+class ResPartner(models.Model):
+    _inherit = "res.partner"
+
+    def _prelog_conductor_email_cc(self, primary_email=None):
+        """Return the contact's valid, unique Prelog CC addresses."""
+        self.ensure_one()
+        primary = (primary_email or self.email or "").strip().casefold()
+        seen = {primary} if primary else set()
+        addresses = []
+        raw_value = (self.prelog_cc or "").replace(";", ",")
+        for address in email_split(raw_value):
+            key = address.strip().casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            addresses.append(address.strip())
+        return ", ".join(addresses)
 
 
 class MvPrelogConductorBatch(models.Model):
@@ -128,11 +147,46 @@ class MvPrelogConductorBatch(models.Model):
     def action_send_all(self):
         self.ensure_one()
         lines = self.recipient_ids.filtered(
-            lambda line: line.included and line.status == "prepared"
+            lambda line: line.included
+            and line.status == "prepared"
+            and line.email
+            and line.attachment_id
         )
         if not lines:
             raise UserError(_("There are no included, prepared emails to send."))
-        return lines.action_send_selected()
+        resend_lines = lines.filtered("is_resend")
+        if resend_lines:
+            confirmation = self.env[
+                "mv.prelog.conductor.resend.confirm"
+            ].create(
+                {
+                    "recipient_ids": [Command.set(lines.ids)],
+                    "resend_recipient_ids": [Command.set(resend_lines.ids)],
+                    "use_send_progress": True,
+                }
+            )
+            return {
+                "type": "ir.actions.act_window",
+                "name": _("Confirm Prelog Resend"),
+                "res_model": "mv.prelog.conductor.resend.confirm",
+                "res_id": confirmation.id,
+                "view_mode": "form",
+                "target": "new",
+            }
+        return self._send_progress_action(lines)
+
+    def _send_progress_action(self, lines):
+        self.ensure_one()
+        return {
+            "type": "ir.actions.client",
+            "tag": "prelog_send_progress",
+            "params": {
+                "batch_id": self.id,
+                "batch_name": self.name,
+                "recipient_ids": lines.ids,
+                "total": len(lines),
+            },
+        }
 
     def action_open_recipients(self):
         self.ensure_one()
@@ -259,6 +313,7 @@ class MvPrelogConductorRecipient(models.Model):
         index=True,
     )
     email = fields.Char(string="Email")
+    email_cc = fields.Char(string="Prelog CC")
     included = fields.Boolean(default=True, string="Include")
     prelog_ids = fields.Many2many(
         "mv.prelog_data",
@@ -362,51 +417,10 @@ class MvPrelogConductorRecipient(models.Model):
         sent = 0
         failures = 0
         for line in candidates:
-            try:
-                with self.env.cr.savepoint():
-                    mail = self.env["mail.mail"].create(line._mail_values())
-                    mail.send(raise_exception=False)
-
-                    if mail.state == "sent":
-                        line.write(
-                            {
-                                "mail_id": mail.id,
-                                "status": "sent",
-                                "queued_at": False,
-                                "sent_at": fields.Datetime.now(),
-                                "error_message": False,
-                            }
-                        )
-                        sent += 1
-                    else:
-                        failure_reason = mail.failure_reason or _(
-                            "The email was not accepted for immediate delivery."
-                        )
-                        # Never leave this message for the scheduled queue. If an
-                        # SMTP server deferred it, record the failure and require
-                        # an intentional retry from the recipient row.
-                        if mail.state == "outgoing":
-                            mail.write({"state": "cancel", "scheduled_date": False})
-                        line.write(
-                            {
-                                "mail_id": mail.id,
-                                "status": "failed",
-                                "queued_at": False,
-                                "sent_at": False,
-                                "error_message": failure_reason,
-                            }
-                        )
-                        failures += 1
-            except Exception as exc:  # keep processing the selected recipients
-                _logger.exception("Could not send prelog recipient %s", line.id)
-                line.write(
-                    {
-                        "status": "failed",
-                        "queued_at": False,
-                        "sent_at": False,
-                        "error_message": str(exc),
-                    }
-                )
+            result = line._send_one()
+            if result["status"] == "sent":
+                sent += 1
+            else:
                 failures += 1
 
         return {
@@ -421,12 +435,86 @@ class MvPrelogConductorRecipient(models.Model):
             },
         }
 
+    def action_send_progress_step(self):
+        """Send one prepared recipient and return a compact progress result."""
+        self.ensure_one()
+        if self.status == "sent":
+            return self._send_progress_result()
+        if not (
+            self.included
+            and self.status == "prepared"
+            and self.email
+            and self.attachment_id
+        ):
+            return self._send_progress_result(
+                status="failed",
+                error=_("This recipient is no longer ready to send."),
+            )
+        return self._send_one()
+
+    def _send_one(self):
+        self.ensure_one()
+        try:
+            with self.env.cr.savepoint():
+                mail = self.env["mail.mail"].create(self._mail_values())
+                mail.send(raise_exception=False)
+
+                if mail.state == "sent":
+                    self.write(
+                        {
+                            "mail_id": mail.id,
+                            "status": "sent",
+                            "queued_at": False,
+                            "sent_at": fields.Datetime.now(),
+                            "error_message": False,
+                        }
+                    )
+                else:
+                    failure_reason = mail.failure_reason or _(
+                        "The email was not accepted for immediate delivery."
+                    )
+                    # Never leave this message for the scheduled queue. If an
+                    # SMTP server deferred it, record the failure and require
+                    # an intentional retry from the recipient row.
+                    if mail.state == "outgoing":
+                        mail.write({"state": "cancel", "scheduled_date": False})
+                    self.write(
+                        {
+                            "mail_id": mail.id,
+                            "status": "failed",
+                            "queued_at": False,
+                            "sent_at": False,
+                            "error_message": failure_reason,
+                        }
+                    )
+        except Exception as exc:  # keep processing the remaining recipients
+            _logger.exception("Could not send prelog recipient %s", self.id)
+            self.write(
+                {
+                    "status": "failed",
+                    "queued_at": False,
+                    "sent_at": False,
+                    "error_message": str(exc),
+                }
+            )
+        return self._send_progress_result()
+
+    def _send_progress_result(self, *, status=None, error=None):
+        self.ensure_one()
+        return {
+            "recipient_id": self.id,
+            "contact": self.contact_id.display_name,
+            "status": status or self.status,
+            "error": error if error is not None else (self.error_message or False),
+        }
+
     def _mail_values(self):
         self.ensure_one()
         return {
             "subject": self.email_subject,
             "body_html": self.email_body,
             "email_to": self.email,
+            "email_cc": self.email_cc or False,
             "email_from": (
                 self.env.company.email_formatted
                 or self.batch_id.requested_by_id.email_formatted
@@ -458,6 +546,9 @@ class MvPrelogConductorRecipient(models.Model):
             old_attachment = line.attachment_id
             keep_old_attachment = bool(line.mail_id)
             current_email = (line.contact_id.email or "").strip()
+            current_email_cc = line.contact_id._prelog_conductor_email_cc(
+                current_email
+            )
             previous_send = line._find_previous_send()
             is_resend = (
                 line.is_resend
@@ -467,6 +558,7 @@ class MvPrelogConductorRecipient(models.Model):
             line.write(
                 {
                     "email": current_email or False,
+                    "email_cc": current_email_cc or False,
                     "included": bool(current_email),
                     "attachment_id": False,
                     "mail_id": False,
@@ -616,6 +708,7 @@ class MvPrelogConductorResendConfirm(models.TransientModel):
     )
     recipient_count = fields.Integer(compute="_compute_counts")
     resend_count = fields.Integer(compute="_compute_counts")
+    use_send_progress = fields.Boolean(default=False)
 
     @api.depends("recipient_ids", "resend_recipient_ids")
     def _compute_counts(self):
@@ -628,6 +721,11 @@ class MvPrelogConductorResendConfirm(models.TransientModel):
         candidates = self.recipient_ids.exists()
         if not candidates:
             raise UserError(_("There are no prepared emails to send."))
+        if self.use_send_progress:
+            batches = candidates.mapped("batch_id")
+            if len(batches) != 1:
+                raise UserError(_("Send All can only process one prelog batch."))
+            return batches._send_progress_action(candidates)
         return candidates.with_context(
             skip_prelog_resend_confirmation=True
         ).action_send_selected()

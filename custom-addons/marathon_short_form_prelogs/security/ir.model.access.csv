@@ -4,4 +4,5 @@ access_mv_prelog_conductor_recipient_user,Prelog Recipient User,model_mv_prelog_
 access_mv_prelog_conductor_wizard_user,Prelog Generator User,model_mv_prelog_conductor_wizard,base.group_user,1,1,1,1
 access_mv_prelog_conductor_week_option_user,Prelog Generator Week Option User,model_mv_prelog_conductor_week_option,base.group_user,1,1,1,1
 access_mv_prelog_conductor_version_option_user,Prelog Generator Version Option User,model_mv_prelog_conductor_version_option,base.group_user,1,1,1,1
+access_mv_prelog_conductor_preview_recipient_user,Prelog Generator Recipient Preview User,model_mv_prelog_conductor_preview_recipient,base.group_user,1,1,1,1
 access_mv_prelog_conductor_resend_confirm_user,Prelog Resend Confirm User,model_mv_prelog_conductor_resend_confirm,base.group_user,1,1,1,1

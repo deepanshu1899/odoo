@@ -4,7 +4,7 @@
         <field name="name">mv.prelog.conductor.recipient.list</field>
         <field name="model">mv.prelog.conductor.recipient</field>
         <field name="arch" type="xml">
-            <list string="Prelog Recipients" multi_edit="1" create="false" delete="false" limit="1000">
+            <list string="Prelog Recipients" js_class="prelog_recipient_list" multi_edit="1" create="false" delete="false" limit="1000">
                 <header>
                     <button name="action_send_selected" string="Send Selected" type="object" class="btn-primary"/>
                     <button name="action_retry_generation" string="Retry Generation" type="object"/>
@@ -14,6 +14,7 @@
                 <field name="contact_id"/>
                 <field name="account_id" optional="show"/>
                 <field name="email"/>
+                <field name="email_cc" optional="show"/>
                 <field name="prelog_count"/>
                 <field name="is_resend" optional="show"/>
                 <field name="attachment_filename" string="Attachment"/>
@@ -56,6 +57,7 @@
                             <field name="included" readonly="status not in ('prepared', 'missing_email', 'failed', 'duplicate')"/>
                             <field name="account_id" readonly="1"/>
                             <field name="email" readonly="1"/>
+                            <field name="email_cc" readonly="1"/>
                             <field name="attachment_filename" readonly="1"/>
                             <field name="mail_id" readonly="1" invisible="not mail_id"/>
                         </group>
@@ -155,7 +157,7 @@
                         </group>
                     </group>
                     <separator string="Recipients"/>
-                    <field name="recipient_ids" nolabel="1" context="{'default_batch_id': id}">
+                    <field name="recipient_ids" widget="prelog_recipient_x2many" nolabel="1" context="{'default_batch_id': id}">
                         <list multi_edit="1" create="false" delete="false" limit="1000">
                             <header>
                                 <button name="action_send_selected" string="Send Selected" type="object" class="btn-primary"/>
@@ -165,6 +167,7 @@
                             <field name="included" widget="prelog_include_checkbox" readonly="not email or status in ('queued', 'sent')"/>
                             <field name="contact_id"/>
                             <field name="email"/>
+                            <field name="email_cc" optional="show"/>
                             <field name="prelog_count"/>
                             <field name="is_resend" optional="show"/>
                             <field name="attachment_filename" string="Attachment"/>

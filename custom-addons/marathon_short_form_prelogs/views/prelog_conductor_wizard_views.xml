@@ -12,31 +12,39 @@
                             Choose one Network, Week, and Version. Preparing creates one workbook per matching contact; it does not send email.
                         </p>
                     </div>
-                    <group>
-                        <group>
+                    <div class="row g-4">
+                        <div class="col-12 col-xl-6">
+                            <group>
                             <field name="network_id" required="1" options="{'no_create': True, 'no_open': True}"/>
                             <field name="week_option_id" options="{'no_create': True, 'no_open': True}"/>
                             <field name="version_option_id" options="{'no_create': True, 'no_open': True}"/>
                             <field name="week" invisible="1"/>
                             <field name="version" invisible="1"/>
-                        </group>
-                        <group string="Quick Week">
-                            <button name="action_this_week" string="This Week" type="object" class="btn btn-secondary"/>
-                            <button name="action_next_week" string="Next Week" type="object" class="btn btn-secondary" disabled="not next_week_available"/>
-                            <field name="next_week_available" invisible="1"/>
-                        </group>
-                    </group>
-                    <separator string="Preview"/>
-                    <group col="6">
-                        <field name="matching_prelog_count" readonly="1"/>
-                        <field name="contact_count" readonly="1"/>
-                        <field name="missing_email_count" readonly="1"/>
-                    </group>
-                    <div class="alert alert-warning" role="alert" invisible="not network_id or matching_prelog_count">
-                        No eligible prelog records match the current selection.
-                    </div>
-                    <div class="d-flex gap-2 mt-4">
-                        <button name="action_prepare_emails" string="Prepare Emails" type="object" class="btn-primary"/>
+                            </group>
+                            <separator string="Preview"/>
+                            <group col="2">
+                                <field name="matching_prelog_count" readonly="1"/>
+                                <field name="contact_count" readonly="1"/>
+                                <field name="missing_email_count" readonly="1"/>
+                            </group>
+                            <div class="alert alert-warning" role="alert" invisible="not network_id or matching_prelog_count">
+                                No eligible prelog records match the current selection.
+                            </div>
+                            <div class="d-flex gap-2 mt-4">
+                                <button name="action_prepare_emails" string="Prepare Emails" type="object" class="btn-primary"/>
+                            </div>
+                        </div>
+                        <div class="col-12 col-xl-6">
+                            <separator string="Recipients"/>
+                            <field name="preview_recipient_ids" nolabel="1" readonly="1">
+                                <list create="false" delete="false" limit="1000" decoration-danger="missing_email">
+                                    <field name="contact_id"/>
+                                    <field name="email"/>
+                                    <field name="prelog_count"/>
+                                    <field name="missing_email" column_invisible="True"/>
+                                </list>
+                            </field>
+                        </div>
                     </div>
                     <field name="week_option_ids" invisible="1"/>
                     <field name="version_option_ids" invisible="1"/>

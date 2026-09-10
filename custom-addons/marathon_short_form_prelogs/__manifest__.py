@@ -2,7 +2,7 @@
 {
     "name": "Prelog Generator",
     "summary": "Prepare contact-specific Short Form prelog workbooks and emails.",
-    "version": "19.0.1.4.0",
+    "version": "19.0.1.6.0",
     "license": "LGPL-3",
     "author": "Marathon Ventures",
     "category": "Operations",
@@ -20,6 +20,7 @@
     "assets": {
         "web.assets_backend": [
             "marathon_short_form_prelogs/static/src/js/prelog_generator_ui.js",
+            "marathon_short_form_prelogs/static/src/xml/prelog_generator_ui.xml",
             "marathon_short_form_prelogs/static/src/scss/prelog_generator.scss",
         ],
     },

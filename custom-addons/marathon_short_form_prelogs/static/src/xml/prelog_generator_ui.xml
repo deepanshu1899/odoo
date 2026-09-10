@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <t t-name="marathon_short_form_prelogs.PrelogRecipientListRenderer"
+       t-inherit="web.ListRenderer"
+       t-inherit-mode="primary">
+        <xpath expr="//th[@t-if=&quot;column.type === 'field'&quot;]//span[@t-esc='column.label']" position="before">
+            <span t-if="column.widget === 'prelog_include_checkbox'"
+                  class="me-2"
+                  title="Include or exclude all available recipients"
+                  t-on-click.stop="">
+                <CheckBox
+                    disabled="!massIncludeRecords.length"
+                    value="allIncluded"
+                    indeterminate="someIncluded"
+                    className="'d-flex m-0'"
+                    onChange.bind="toggleAllIncluded"
+                />
+            </span>
+        </xpath>
+    </t>
+
+    <t t-name="marathon_short_form_prelogs.PrelogSendProgressDialog">
+        <Dialog title="'Sending Prelogs'"
+                size="'md'"
+                contentClass="'o_prelog_send_progress_dialog'">
+            <div class="text-center mb-4">
+                <div class="fs-5 fw-semibold" t-esc="props.batchName"/>
+                <div t-if="state.running" class="text-muted mt-1">
+                    Sending email <t t-esc="state.currentNumber"/> of <t t-esc="props.total"/>
+                    <t t-if="state.currentContact"> — <t t-esc="state.currentContact"/></t>
+                </div>
+                <div t-else="" class="text-muted mt-1">Send All complete</div>
+            </div>
+
+            <div class="progress o_prelog_send_progress_bar" role="progressbar"
+                 t-att-aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100">
+                <div class="progress-bar"
+                     t-att-class="state.failed ? 'bg-warning' : 'bg-primary'"
+                     t-att-style="'width: ' + percent + '%'">
+                    <t t-esc="percent"/>%
+                </div>
+            </div>
+            <div class="text-center fs-5 mt-2">
+                <strong><t t-esc="state.completed"/> / <t t-esc="props.total"/></strong>
+            </div>
+
+            <div class="d-flex justify-content-center gap-4 mt-3">
+                <span class="text-success"><strong t-esc="state.sent"/> sent</span>
+                <span t-att-class="state.failed ? 'text-danger' : 'text-muted'">
+                    <strong t-esc="state.failed"/> failed
+                </span>
+            </div>
+
+            <div t-if="state.connectionError" class="alert alert-danger mt-4 mb-0" role="alert">
+                <strong>Sending stopped.</strong>
+                <div t-esc="state.connectionError"/>
+                <div>Close this window, then choose Send All again for any remaining prepared emails.</div>
+            </div>
+            <div t-elif="!state.running and state.failed" class="alert alert-warning mt-4 mb-0" role="alert">
+                The send finished with failures. Close this window to review the affected recipient rows.
+            </div>
+            <div t-elif="!state.running" class="alert alert-success mt-4 mb-0" role="status">
+                All selected prelogs were sent successfully.
+            </div>
+
+            <t t-set-slot="footer">
+                <span t-if="state.running" class="text-muted">
+                    Keep this window open while Odoo sends the emails.
+                </span>
+                <button t-else="" type="button" class="btn btn-primary" t-on-click="closeAndRefresh">
+                    Close and Refresh Batch
+                </button>
+            </t>
+        </Dialog>
+    </t>
+</templates>
