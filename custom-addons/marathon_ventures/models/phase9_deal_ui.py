@@ -15,8 +15,8 @@ the form. We fix that here by:
      value immediately, before save - including the editable
      `client_account` (Advertiser) Many2one which is NOT computed.
 
-Also hosts the inline-collapse toggle for the "Additional details"
-section and the Cancel footer action.
+Also provides the Deal Owner field used by the Short Form layout and the
+Cancel footer action.
 """
 import logging
 from odoo import models, fields, api
@@ -28,6 +28,18 @@ class MvDealUiPhase9(models.Model):
     _name = 'mv.deal'
     _inherit = 'mv.deal'
 
+    deal_owner_id = fields.Many2one(
+        comodel_name='res.users',
+        string='Deal Owner (AEs)',
+        default=lambda self: self.env.user,
+        domain=[('share', '=', False)],
+        ondelete='restrict',
+        index=True,
+    )
+
+    # Kept as an upgrade shim for databases whose stored copy of the old
+    # Phase 9 view still references the inline Additional Details toggle.
+    # The replacement view no longer renders this field or calls the action.
     show_additional_details = fields.Boolean(
         string='Show Additional Details',
         default=False,
@@ -129,7 +141,7 @@ class MvDealUiPhase9(models.Model):
             )
 
     # ------------------------------------------------------------------
-    # Inline collapse toggle + Cancel footer action
+    # Compatibility action for the retired inline toggle + footer action
     # ------------------------------------------------------------------
     def action_toggle_additional_details(self):
         for rec in self:

@@ -53,16 +53,19 @@
         </group>
       </xpath>
 
-      <!-- (C) Replace Details page with the redesigned essentials layout -->
+      <!-- (C) Short Form layout. Other record types intentionally do not
+           expose these fields; their layouts can be added independently. -->
       <xpath expr="//notebook/page[1]" position="replace">
-        <page string="Details" name="page_details">
+        <page string="Details" name="page_details"
+              invisible="sf_record_type != 'Short_Form'">
 
           <div class="mv-section-label">CAMPAIGN INFORMATION</div>
           <!-- Three sibling inner-groups give us a true 3-column grid in
                Odoo 19 (col=6 / colspan=2 on fields is unreliable in OWL).
                The .mv-essentials-grid class is the CSS hook for vertical
                label/input stacking (phase9_deal_layout.scss). -->
-          <group col="3" name="grp_campaign_info" class="mv-essentials-grid">
+          <group col="3" name="grp_campaign_info"
+                 class="mv-essentials-grid mv-details-row">
             <group>
               <field name="program" required="1"
                      placeholder="Select program..."/>
@@ -71,43 +74,48 @@
                      placeholder="Select advertiser..."/>
             </group>
             <group>
-              <field name="brands" required="1"
+              <field name="brands" string="Brand" required="1"
                      placeholder="Select brand..."/>
-              <field name="contact" string="Contact / Account" placeholder="Select contact..." required="1"
-                     context="{'partner_display_contact_first': True}"/>
+              <field name="commercial_type" string="Commercial Type"
+                     required="1"/>
             </group>
             <group>
               <field name="campaign" placeholder="e.g., 2Q26 :30 spot"/>
+              <field name="contact" string="Contact / Account"
+                     placeholder="Select contact..." required="1"
+                     context="{'partner_display_contact_first': True}"/>
             </group>
           </group>
 
-          <div class="mv-section-label">SPOT DETAILS</div>
-          <group col="3" name="grp_spot_details" class="mv-essentials-grid">
+          <group col="3" name="grp_spot_details"
+                 class="mv-essentials-grid mv-details-row">
             <group>
               <field name="length" required="1"/>
             </group>
             <group>
-              <field name="commercial_type" string="Commercial Type" required="1"/>
-            </group>
-            <group>
               <field name="min_sep" string="Minimum Separation"
-                     class="mv-highlight" required="1"/>
+                     required="1"/>
             </group>
-          </group>
-
-          <div class="mv-section-label">Network DETAILS</div>
-          <group col="3" name="grp_nwtwork_details" class="mv-essentials-grid">
             <group>
               <field name="network_deal_number"/>
             </group>
+          </group>
+
+          <group col="3" name="grp_deal_numbers"
+                 class="mv-essentials-grid mv-details-row">
             <group>
               <field name="product_code" required="1"/>
             </group>
             <group>
-              <field name="access_code" required="1" />
+              <field name="access_code" required="1"/>
+            </group>
+            <group>
+              <field name="agency_deal_number"/>
             </group>
           </group>
-          <group col="3" name="grp_nwtwork_details" class="mv-essentials-grid">
+
+          <group col="3" name="grp_client_codes"
+                 class="mv-essentials-grid mv-details-row">
             <group>
               <field name="client_code" required="1"/>
             </group>
@@ -117,57 +125,12 @@
             <group>
               <field name="pi"/>
             </group>
-            <group>
-              <field name="create_uid" readonly="1"/>
-            </group>
           </group>
 
-          <!-- Inline collapse bar for Additional details -->
-          <div class="mv-additional-bar" name="mv_additional_bar">
-            <span>
-              <button name="action_toggle_additional_details"
-                      type="object"
-                      class="btn btn-link p-0 mv-additional-caret"
-                      string=" "/>
-              <span class="mv-additional-label">
-                Additional details (notes, account exec, billing code, system flags)
-              </span>
-            </span>
-            <span class="mv-additional-hint">
-              <span invisible="show_additional_details">collapsed by default</span>
-              <span invisible="not show_additional_details">expanded</span>
-            </span>
-          </div>
-          <field name="show_additional_details" invisible="1"/>
-
-          <group col="6" name="grp_additional"
-                 invisible="not show_additional_details">
-            <group string="Workflow / Scheduling" colspan="3">
-              <field name="sales_plan"/>
-              <!-- <field name="bundle_action"/>
-              <field name="bundle_start_week"/>
-              <field name="bundle_version"/> -->
-              <field name="status"/>
-              <field name="tier"/>
-              <field name="x_class"/>
-              <field name="log_exp_date"/>
-              <field name="hiatus_dates"/>
-              <field name="demographics"/>
-              <field name="agency_deal_number"/>
-              <field name="raycom_comments"/>
-            </group>
-
-            <group string="Pricing / Flags / Computed" colspan="3">
-              <field name="actual_rating_year" readonly="1"/>
-              <field name="ratings_year"       readonly="1"/>
-              <field name="ratings_quarter"    readonly="1"/>
-              <field name="e_i_friendly"/>
-              <field name="revised"/>
-              <field name="schedule_count"       readonly="1"/>
-              <field name="total_booked_units"   readonly="1"/>
-              <field name="total_booked_dollars" widget="monetary" readonly="1"/>
-              <field name="currency_id"          invisible="1"/>
-              <field name="entity_name"          readonly="1"/>
+          <group col="3" name="grp_deal_owner"
+                 class="mv-essentials-grid mv-details-row">
+            <group>
+              <field name="deal_owner_id"/>
             </group>
           </group>
 
@@ -182,6 +145,29 @@
                     string="Save Deal" class="btn btn-primary"/>
           </div>
 
+        </page>
+
+        <page string="Additional Details" name="page_additional_details"
+              invisible="sf_record_type != 'Short_Form'">
+          <group col="2" name="grp_additional_details"
+                 class="mv-essentials-grid mv-essentials-grid-2">
+            <group>
+              <field name="sales_plan"/>
+              <field name="status"/>
+              <field name="x_class"/>
+              <field name="log_exp_date"/>
+              <field name="hiatus_dates"/>
+            </group>
+            <group>
+              <field name="ratings_year" readonly="1"/>
+              <field name="ratings_quarter" readonly="1"/>
+              <field name="e_i_friendly"/>
+              <field name="total_booked_units" readonly="1"/>
+              <field name="total_booked_dollars" widget="monetary"
+                     readonly="1"/>
+              <field name="currency_id" invisible="1"/>
+            </group>
+          </group>
         </page>
       </xpath>
 
