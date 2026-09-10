@@ -2,6 +2,7 @@ import csv
 import base64
 import io
 from datetime import date, datetime
+from unittest.mock import patch
 
 from odoo import Command
 from odoo.exceptions import UserError
@@ -47,6 +48,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
             'end_time': 'v_10_00a',
             'days_allowed': [Command.set(cls.monday.ids)],
             'rate': 100.0,
+            'units_available': 1000,
             'status': 'sold',
         })
 
@@ -62,10 +64,11 @@ class TestPrelogFuzzyMatching(TransactionCase):
             'end_time': 'v_10_00a',
             'days_allowed': [Command.set(cls.monday.ids)],
             'rate': 100.0,
+            'units_available': 1000,
             'status': 'sold',
         })
 
-    def _create_prelog(self, **overrides):
+    def _create_prelog(self, store_matching=True, **overrides):
         values = {
             'import_program': self.program.id,
             'import_week_value': self.week,
@@ -78,10 +81,28 @@ class TestPrelogFuzzyMatching(TransactionCase):
             'schedulelength': '30',
             'rate': 100.0,
             'advertiserproduct': 'Test Advertiser / Product',
-            'import_match_status': 'created_without_schedule',
+            'import_match_status': 'unmatched',
         }
         values.update(overrides)
-        return self.env['mv.prelog_data'].create(values)
+        prelog = self.env['mv.prelog_data'].create(values)
+        if prelog.schedule:
+            prelog.write({
+                'import_match_status': 'matched',
+                'suggested_schedule': False,
+                'possible_schedules': False,
+                'match_flags': False,
+                'info': False,
+            })
+        elif store_matching and not prelog.removed:
+            # Workbench requests only read stored results. Tests create records
+            # directly, so mirror the background import's persisted match pass.
+            self.env['mv.prelog_data']._prelog_store_matching(
+                prelog,
+                prelog.import_program,
+                prelog.import_week_value,
+                attach=False,
+            )
+        return prelog
 
     def test_search_and_attach_suggested_schedule(self):
         prelog = self._create_prelog()
@@ -97,7 +118,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
         self.assertEqual(row['id'], prelog.id)
         self.assertEqual(row['suggested']['id'], self.schedule.id)
         self.assertTrue(row['suggestion_attachable'])
-        self.assertFalse(row['reason'])
+        self.assertEqual(row['info'], '1 suggestion(s)')
         self.assertEqual(row['match_quality'], 'exact')
 
         applied = self.env['mv.prelog_data'].fuzzy_match_apply([{
@@ -133,7 +154,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
         row = result['rows'][0]
         self.assertEqual(row['suggested']['id'], self.schedule.id)
         self.assertTrue(row['time_mismatch'])
-        self.assertEqual(row['reason'], 'Out of Rotation')
+        self.assertEqual(row['info'], '1 suggestion(s)')
 
         with self.assertRaises(UserError):
             self.env['mv.prelog_data'].fuzzy_match_apply([{
@@ -158,6 +179,111 @@ class TestPrelogFuzzyMatching(TransactionCase):
         parsed = list(csv.reader(io.StringIO(exported['content'])))
         self.assertEqual(exported['count'], 1)
         self.assertEqual(parsed[1][-1], 'Out of Rotation')
+
+    def test_exact_rotation_outranks_rate_match_and_keeps_runner_up(self):
+        """A bad schedule rate must not hide the correct rotation.
+
+        This mirrors the TCN 8/24 V2 example: the spot aired at 9:22 PM,
+        the 9-10 PM schedule had an incorrect rate, and the old matcher chose
+        the rate-matching 8-9 PM schedule instead.
+        """
+        case_week = date(2026, 8, 24)
+        case_program = self.env['mv.programs'].create({
+            'name': 'TCN Rate Priority Regression',
+            'clientcode': 'TRP',
+        })
+        deal = self.env['mv.deal'].create({
+            'program': case_program.id,
+            'network_deal_number': 'FZY-RATE-PRIORITY',
+            'length': 'v_120',
+        })
+        eight_to_nine = self.env['mv.schedules'].create({
+            'deal_parent': deal.id,
+            'week': case_week,
+            'start_time': 'v_08_00p',
+            'end_time': 'v_09_00p',
+            'days_allowed': [Command.set(self.monday.ids)],
+            'rate': 190.0,
+            'units_available': 10,
+            'status': 'sold',
+        })
+        nine_to_ten = self.env['mv.schedules'].create({
+            'deal_parent': deal.id,
+            'week': case_week,
+            'start_time': 'v_09_00p',
+            'end_time': 'v_10_00p',
+            'days_allowed': [Command.set(self.monday.ids)],
+            'rate': 0.0,
+            'units_available': 10,
+            'status': 'sold',
+        })
+        prelog = self._create_prelog(
+            import_program=case_program.id,
+            import_week_value=case_week,
+            network=case_program.display_name,
+            broadcast_network=case_program.display_name,
+            airdate=case_week,
+            version=8,
+            network_deal_number='FZY-RATE-PRIORITY',
+            scheduletime='09:22:25 PM',
+            schedulelength='120',
+            rate=190.0,
+        )
+
+        result = self.env['mv.prelog_data'].fuzzy_match_search(
+            case_program.id,
+            case_week.isoformat(),
+            8,
+        )
+        row = result['rows'][0]
+        self.assertEqual(row['suggested']['id'], nine_to_ten.id)
+        self.assertTrue(row['rate_mismatch'])
+        self.assertFalse(row['time_mismatch'])
+        self.assertEqual(row['match_quality'], 'fuzzy')
+        self.assertEqual(row['info'], '2 suggestion(s)')
+        self.assertEqual(
+            [alternative['id'] for alternative in row['alternatives']],
+            [eight_to_nine.id],
+        )
+        self.assertFalse(row['alternatives'][0]['rate_mismatch'])
+        self.assertFalse(row['alternatives'][0]['exact_time_match'])
+
+        with self.assertRaises(UserError):
+            self.env['mv.prelog_data'].fuzzy_match_apply([{
+                'prelog_id': prelog.id,
+                'schedule_id': nine_to_ten.id,
+                'source': 'suggested',
+            }])
+
+        self.env['mv.prelog_data'].fuzzy_match_apply([{
+            'prelog_id': prelog.id,
+            'schedule_id': nine_to_ten.id,
+            'source': 'suggested',
+            'confirmed_override': True,
+        }])
+        self.assertEqual(prelog.schedule, nine_to_ten)
+
+        # The runner-up's Attach button sends a confirmed manual choice. Verify
+        # that Operations can deliberately choose it instead of rank #1.
+        operator_choice = self._create_prelog(
+            import_program=case_program.id,
+            import_week_value=case_week,
+            network=case_program.display_name,
+            broadcast_network=case_program.display_name,
+            airdate=case_week,
+            version=9,
+            network_deal_number='FZY-RATE-PRIORITY',
+            scheduletime='09:22:25 PM',
+            schedulelength='120',
+            rate=190.0,
+        )
+        self.env['mv.prelog_data'].fuzzy_match_apply([{
+            'prelog_id': operator_choice.id,
+            'schedule_id': eight_to_nine.id,
+            'source': 'manual',
+            'confirmed_override': True,
+        }])
+        self.assertEqual(operator_choice.schedule, eight_to_nine)
 
     def test_network_alias_matches_and_wrong_network_is_rejected(self):
         alias_prelog = self._create_prelog(version=2)
@@ -214,7 +340,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
             result['rows'][0]['suggested']['id'],
             self.other_schedule.id,
         )
-        self.assertFalse(result['rows'][0]['reason'])
+        self.assertEqual(result['rows'][0]['info'], '1 suggestion(s)')
         self.assertFalse(prelog.schedule)
 
     def test_missing_day_or_length_is_not_silently_accepted(self):
@@ -225,7 +351,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
             6,
         )
         self.assertFalse(day_result['rows'][0]['suggested'])
-        self.assertEqual(day_result['rows'][0]['reason'], 'No day match')
+        self.assertEqual(day_result['rows'][0]['info'], 'Missing air date')
 
         missing_length = self._create_prelog(
             version=7,
@@ -241,10 +367,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
             self.schedule.id,
         )
         self.assertTrue(length_result['rows'][0]['length_mismatch'])
-        self.assertIn(
-            'Length mismatch',
-            length_result['rows'][0]['reason'],
-        )
+        self.assertEqual(length_result['rows'][0]['info'], '1 suggestion(s)')
         self.assertFalse(missing_day.schedule)
         self.assertFalse(missing_length.schedule)
 
@@ -319,6 +442,65 @@ class TestPrelogFuzzyMatching(TransactionCase):
 
         self.assertEqual(military_values['scheduletime'], '4:46:37 PM')
         self.assertEqual(standard_values['scheduletime'], '4:46:37 PM')
+
+    def test_background_import_persists_exact_fuzzy_and_no_suggestion(self):
+        job = self.env['mv.prelog_import_job'].create({
+            'upload_file': base64.b64encode(b'test workbook'),
+            'upload_filename': 'stored-matching-test.xlsx',
+            'file_checksum': 'stored-matching-test',
+            'program_id': self.program.id,
+            'import_week': self.week,
+            'prelog_version': 41,
+            'submitted_by_id': self.env.user.id,
+        })
+        base_row = {
+            'airdate': self.week,
+            'broadcast_network': 'tCn',
+            'rate': 100.0,
+            'schedulelength': '30',
+            'advertiserproduct': 'Background Import Test',
+        }
+        rows = [
+            {
+                **base_row,
+                'network_deal_number': 'FZY-100',
+                'scheduletime': '09:30:00 AM',
+            },
+            {
+                **base_row,
+                'network_deal_number': 'FZY-100',
+                'scheduletime': '11:00:00 AM',
+            },
+            {
+                **base_row,
+                'network_deal_number': 'NOT-FOUND',
+                'scheduletime': '09:30:00 AM',
+            },
+        ]
+
+        with patch.object(
+            PrelogImportEngine,
+            'extract_rows_and_week',
+            return_value=(rows, self.week),
+        ):
+            summary = job._process_rows()
+
+        self.assertEqual(summary['matched_count'], 1)
+        self.assertEqual(summary['unmatched_count'], 2)
+        imported = job.prelog_ids.sorted('id')
+        self.assertEqual(len(imported), 3)
+        self.assertEqual(imported[0].schedule, self.schedule)
+        self.assertEqual(imported[0].import_match_status, 'matched')
+        self.assertFalse(imported[0].suggested_schedule)
+        self.assertFalse(imported[0].info)
+        self.assertFalse(imported[1].schedule)
+        self.assertEqual(imported[1].suggested_schedule, self.schedule)
+        self.assertEqual(imported[1].info, '1 suggestion(s)')
+        self.assertFalse(imported[2].suggested_schedule)
+        self.assertEqual(
+            imported[2].info,
+            'No schedules found for deal number',
+        )
 
     def test_upload_time_window_includes_rotation_boundaries(self):
         engine = PrelogImportEngine(
@@ -457,7 +639,18 @@ class TestPrelogFuzzyMatching(TransactionCase):
             'suggestions': 1,
             'no_suggestion': 1,
             'removed': 1,
+            'overruns': 0,
         })
+        self.assertEqual(result['dollars'], {
+            'all': 300.0,
+            'matched': 100.0,
+            'unmatched': 200.0,
+            'suggestions': 100.0,
+            'no_suggestion': 100.0,
+            'removed': 100.0,
+            'overruns': 0.0,
+        })
+        self.assertEqual(result['filtered_dollars'], 300.0)
         self.assertNotIn(already_removed.id, [row['id'] for row in result['rows']])
 
         self.env['mv.prelog_data'].fuzzy_match_set_removed(
@@ -465,7 +658,7 @@ class TestPrelogFuzzyMatching(TransactionCase):
         )
         self.assertTrue(matched.removed)
         self.assertFalse(matched.schedule)
-        self.assertEqual(matched.import_match_status, 'created_without_schedule')
+        self.assertEqual(matched.import_match_status, 'unmatched')
 
         removed = self.env['mv.prelog_data'].fuzzy_match_search(
             self.program.id, self.week.isoformat(), 8, 0, 200, 'removed',
@@ -475,21 +668,21 @@ class TestPrelogFuzzyMatching(TransactionCase):
             [matched.id], False, self.program.id, self.week.isoformat(), 8,
         )
         self.assertFalse(matched.removed)
-        self.assertFalse(matched.schedule)
+        self.assertEqual(matched.schedule, self.schedule)
         refreshed = self.env['mv.prelog_data'].fuzzy_match_search(
             self.program.id, self.week.isoformat(), 8, 0, 200, 'suggestions',
         )
-        self.assertIn(matched.id, [row['id'] for row in refreshed['rows']])
+        self.assertNotIn(matched.id, [row['id'] for row in refreshed['rows']])
         self.assertIn(suggested.id, [row['id'] for row in refreshed['rows']])
         self.assertFalse(no_suggestion.schedule)
 
         unmatched = self.env['mv.prelog_data'].fuzzy_match_search(
             self.program.id, self.week.isoformat(), 8, 0, 200, 'unmatched',
         )
-        self.assertEqual(unmatched['total'], 3)
+        self.assertEqual(unmatched['total'], 2)
         self.assertEqual(
             {row['id'] for row in unmatched['rows']},
-            {matched.id, suggested.id, no_suggestion.id},
+            {suggested.id, no_suggestion.id},
         )
         self.assertEqual(
             {row['status'] for row in unmatched['rows']},
@@ -651,10 +844,13 @@ class TestPrelogFuzzyMatching(TransactionCase):
                 'schedulelength': '30',
                 'rate': 100.0,
                 'advertiserproduct': 'Bulk %s' % index,
-                'import_match_status': 'created_without_schedule',
+                'import_match_status': 'unmatched',
             }
             for index in range(205)
         ])
+        self.env['mv.prelog_data']._prelog_store_matching(
+            prelogs, self.program, self.week, attach=False,
+        )
         page = self.env['mv.prelog_data'].fuzzy_match_search(
             self.program.id, self.week.isoformat(), 30,
         )
@@ -731,7 +927,40 @@ class TestPrelogFuzzyMatching(TransactionCase):
         row = result['rows'][0]
         self.assertEqual(row['id'], prelog.id)
         self.assertEqual(row['match_quality'], 'fuzzy')
-        self.assertIn('Within fuzzy buffer', row['reason'])
+        self.assertEqual(row['info'], '1 suggestion(s)')
+        self.assertTrue(row['time_mismatch'])
+
+    def test_workbench_reads_stored_match_until_refresh(self):
+        prelog = self._create_prelog(
+            version=40,
+            scheduletime='11:00:00 AM',
+        )
+        before = self.env['mv.prelog_data'].fuzzy_match_search(
+            self.program.id, self.week.isoformat(), 40,
+        )['rows'][0]
+        self.assertEqual(before['status'], 'suggestion')
+        self.assertTrue(before['time_mismatch'])
+
+        # Make the Schedule an exact match. An ordinary page request must keep
+        # showing the stored import verdict; only Refresh re-runs matching.
+        self.schedule.write({'end_time': 'v_11_00a'})
+        still_stored = self.env['mv.prelog_data'].fuzzy_match_search(
+            self.program.id, self.week.isoformat(), 40,
+        )['rows'][0]
+        self.assertEqual(still_stored['status'], 'suggestion')
+        self.assertTrue(still_stored['time_mismatch'])
+        self.assertFalse(prelog.schedule)
+
+        refreshed = self.env['mv.prelog_data'].fuzzy_match_refresh(
+            self.program.id, self.week.isoformat(), 40,
+        )
+        self.assertEqual(refreshed['attached'], 1)
+        self.assertEqual(prelog.schedule, self.schedule)
+        after = self.env['mv.prelog_data'].fuzzy_match_search(
+            self.program.id, self.week.isoformat(), 40,
+        )['rows'][0]
+        self.assertEqual(after['status'], 'matched')
+        self.assertFalse(after['suggested'])
 
     def test_options_default_to_current_users_latest_completed_upload(self):
         job = self.env['mv.prelog_import_job'].create({

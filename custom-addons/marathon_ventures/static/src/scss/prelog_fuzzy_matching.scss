@@ -845,6 +845,17 @@
     border: 1px solid #d9895b;
 }
 
+// Rate errors are operational data-entry problems, not merely a weak fuzzy
+// signal. Give the differing rate a quiet warning background in addition to
+// the shared underline treatment so it is the first discrepancy users see.
+.mv-prelog-candidates__rate-warning {
+    display: inline-block;
+    margin: -0.1rem -0.25rem;
+    padding: 0.1rem 0.25rem;
+    border-radius: 4px;
+    background: #fff1d6;
+}
+
 @media (max-width: 900px) {
     .mv-fuzzy {
         &__searchbar { align-items: stretch; flex-direction: column; }
@@ -852,4 +863,3 @@
         &__bulk-actions { flex-wrap: wrap; }
     }
 }
-

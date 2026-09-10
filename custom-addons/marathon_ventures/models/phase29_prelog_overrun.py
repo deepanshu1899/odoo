@@ -156,7 +156,7 @@ class MvPrelogDataOverrun(models.Model):
                 ('id', 'not in', attached.ids),
             ])
             if stale_overrun:
-                stale_overrun.write({'is_overrun': False})
+                stale_overrun.write({'is_overrun': False, 'info': False})
 
             count = len(attached)
             cap = int(schedule.units_available or 0)
@@ -176,10 +176,16 @@ class MvPrelogDataOverrun(models.Model):
             overrun_recs = attached[-overrun:] if overrun else self.browse()
             in_cap_recs = attached - overrun_recs
 
-            need_true = overrun_recs.filtered(lambda p: not p.is_overrun)
-            if need_true:
-                need_true.write({'is_overrun': True})
-            need_false = in_cap_recs.filtered(lambda p: p.is_overrun)
-            if need_false:
-                need_false.write({'is_overrun': False})
+            if overrun_recs:
+                overrun_recs.write({
+                    'is_overrun': True,
+                    'info': (
+                        'Schedule %s has %s unit(s) but %s prelog(s) are '
+                        'attached - over by %s.'
+                    ) % (
+                        schedule.display_name or '', cap, count, overrun,
+                    ),
+                })
+            if in_cap_recs:
+                in_cap_recs.write({'is_overrun': False, 'info': False})
         return True

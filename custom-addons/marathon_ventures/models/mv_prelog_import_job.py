@@ -109,7 +109,25 @@ class MvPrelogImportJob(models.Model):
                 "notification_email": user_email,
             }
         )
+        job._trigger_cron()
         return job, True
+
+    def _trigger_cron(self):
+        """Best-effort immediate start; the minute cron remains the fallback."""
+        cron = self.env.ref(
+            "marathon_ventures.cron_mv_prelog_import_jobs",
+            raise_if_not_found=False,
+        )
+        if not cron:
+            return
+        try:
+            cron.sudo()._trigger()
+        except Exception:
+            _logger.exception(
+                "Prelog import job %s: cron trigger failed; the job stays "
+                "queued and will run on the next tick.",
+                self.ids,
+            )
 
     @api.model
     def _cron_process_prelog_import_jobs(self):
@@ -192,17 +210,13 @@ class MvPrelogImportJob(models.Model):
 
         success_rows = []
         error_rows = []
-        matched_count = 0
-        unmatched_count = 0
         error_count = 0
         total_rate_amount = 0.0
-        matched_rate_amount = 0.0
-        unmatched_rate_amount = 0.0
-        # Track schedules that gained an attached prelog during this
-        # batch so we can recompute their overrun_amount exactly once
-        # after the loop instead of per-row.
-        touched_schedule_ids = set()
+        created = []
 
+        # Phase 1: normalize and create. No matching happens inside the row
+        # parser; that would query schedules once per row and could disagree
+        # with the Workbench's fuzzy matcher.
         for row_index, row in enumerate(rows, start=engine._first_data_row_number()):
             vals = False
             rate_added = False
@@ -214,17 +228,7 @@ class MvPrelogImportJob(models.Model):
                 rate_added = True
                 with self.env.cr.savepoint():
                     prelog = self.env["mv.prelog_data"].create(vals)
-
-                if vals["import_match_status"] == "matched":
-                    matched_count += 1
-                    matched_rate_amount += rate_value
-                    success_rows.append(self._build_success_csv_row(engine, prelog, row, vals))
-                    if prelog.schedule:
-                        touched_schedule_ids.add(prelog.schedule.id)
-                else:
-                    unmatched_count += 1
-                    unmatched_rate_amount += rate_value
-                    error_rows.append(self._build_error_csv_row(engine, row, vals, status="no-match"))
+                created.append((prelog, row, vals, rate_value))
             except Exception as exc:
                 _logger.exception("Prelog import job %s row %s failed.", self.id, row_index)
                 error_count += 1
@@ -236,14 +240,47 @@ class MvPrelogImportJob(models.Model):
                     except (TypeError, ValueError):
                         pass
 
-        # Overrun recalc: one pass across every schedule that gained
-        # an attached prelog in this batch. Idempotent - handles the
-        # existing_prelogs.unlink() case too because unlink() on
-        # mv.prelog_data already funnels through the same recompute.
+        # Phase 2: one matcher performs exact attachment and persists fuzzy
+        # suggestions, issue flags and Info for everything that remains.
+        prelogs = self.env["mv.prelog_data"].browse([
+            prelog.id for prelog, _row, _vals, _rate in created
+        ])
+        if prelogs:
+            self.env["mv.prelog_data"]._prelog_store_matching(
+                prelogs, self.program_id, self.import_week, attach=True,
+            )
+
+        touched_schedule_ids = set(prelogs.mapped('schedule').ids)
         if touched_schedule_ids:
             self.env["mv.prelog_data"]._recompute_prelog_overruns(
                 touched_schedule_ids,
             )
+
+        # Reporting is built from the persisted verdict so the emailed CSV and
+        # Workbench always agree.
+        matched_count = 0
+        unmatched_count = 0
+        matched_rate_amount = 0.0
+        unmatched_rate_amount = 0.0
+        for prelog, row, vals, rate_value in created:
+            if prelog.schedule:
+                matched_count += 1
+                matched_rate_amount += rate_value
+                success_rows.append(
+                    self._build_success_csv_row(engine, prelog, row, vals)
+                )
+            else:
+                unmatched_count += 1
+                unmatched_rate_amount += rate_value
+                error_rows.append(self._build_error_csv_row(
+                    engine,
+                    row,
+                    dict(
+                        vals or {},
+                        import_match_detail=self._match_failure_detail(prelog),
+                    ),
+                    status="no-match",
+                ))
 
         attachments = self._create_result_attachments(
             engine=engine,
@@ -410,6 +447,24 @@ class MvPrelogImportJob(models.Model):
         for row in rows:
             writer.writerow(row)
         return buffer.getvalue().encode("utf-8")
+
+    @staticmethod
+    def _match_failure_detail(prelog):
+        """Describe the same persisted result the Workbench will display."""
+        flags = [token for token in (prelog.match_flags or '').split(',') if token]
+        if prelog.info:
+            detail = prelog.info
+        else:
+            detail = "No schedule matched."
+        if prelog.suggested_schedule:
+            differences = ', '.join(
+                token for token in flags if token != 'ambiguous'
+            ) or 'nothing'
+            detail = "Best suggestion %s differs on: %s." % (
+                prelog.suggested_schedule.display_name,
+                differences,
+            )
+        return detail
 
     def _build_success_csv_row(self, engine, prelog, raw_row, vals):
         row = {

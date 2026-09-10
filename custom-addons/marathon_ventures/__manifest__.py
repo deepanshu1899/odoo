@@ -2,7 +2,7 @@
 {
     'name': 'Marathon Ventures',
     'summary': 'Salesforce -> Odoo 19 migration of Marathon Ventures CRM/Sales/Traffic schema.',
-    'version': '19.0.1.2.8',
+    'version': '19.0.1.2.9',
     'license': 'LGPL-3',
     'author': 'Marathon Ventures (generated)',
     'website': '',
@@ -196,6 +196,7 @@
             'marathon_ventures/static/src/js/mv_email_tags/mv_email_tags.xml',
         ],
         'web.assets_tests': [
+            'marathon_ventures/static/tests/tours/prelog_workbench_tour.js',
             # Browser tour driving the Postlog Workbench; see
             # tests/test_postlog_workbench_ui.py
             'marathon_ventures/static/tests/tours/postlog_workbench_tour.js',

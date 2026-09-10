@@ -7,6 +7,9 @@
       <list string="Prelog Data">
         <field name="name"/>
         <field name="schedule"/>
+        <field name="import_match_status" optional="show"/>
+        <field name="suggested_schedule" optional="hide"/>
+        <field name="info" optional="show"/>
         <field name="network_deal_number"/>
         <field name="actual_000_primary_demo"/>
         <field name="advertiserproduct"/>
@@ -90,6 +93,19 @@
                 <field name="total_000_primary_demo"/>
                 <field name="total_dollars_earned"/>
                 <field name="version"/>
+              </group>
+            </page>
+            <page string="Workbench">
+              <group>
+                <field name="import_match_status"/>
+                <field name="suggested_schedule"/>
+                <field name="info"/>
+                <field name="match_flags"/>
+                <field name="possible_schedules" widget="json"/>
+                <field name="import_match_detail"/>
+                <field name="import_job"/>
+                <field name="import_program"/>
+                <field name="import_week_value"/>
               </group>
             </page>
             <page string="SF Metadata">

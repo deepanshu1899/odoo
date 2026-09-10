@@ -26,6 +26,8 @@ class MvPrelogDataFuzzyMatching(models.Model):
 
     _FUZZY_PAGE_SIZE = 200
     _FUZZY_TIME_BUFFER_MINUTES = 120
+    _FUZZY_MAX_ALTERNATIVES = 4
+    _FUZZY_MAX_ALTERNATIVE_DIFFERENCES = 2
     _FUZZY_DAY_ORDER = {
         'mon': 0,
         'tue': 1,
@@ -95,7 +97,12 @@ class MvPrelogDataFuzzyMatching(models.Model):
         import_job_id=False,
         sort_direction='asc',
     ):
-        """Return a classified page for the Prelog Operations Workbench."""
+        """Return one database-backed page of stored Prelog results.
+
+        Matching is intentionally absent from this request. The background
+        import (or explicit Refresh) has already populated status, suggestions,
+        flags and Info, so Postgres can filter, count, sort and LIMIT directly.
+        """
         self._fuzzy_check_access()
         program, selected_week, selected_version = self._fuzzy_validate_optional_filters(
             program_id,
@@ -105,79 +112,41 @@ class MvPrelogDataFuzzyMatching(models.Model):
         offset = max(self._fuzzy_int(offset, default=0), 0)
         limit = self._fuzzy_int(limit, default=self._FUZZY_PAGE_SIZE)
         limit = min(max(limit, 1), self._FUZZY_PAGE_SIZE)
-        domain = self._fuzzy_prelog_domain(
+        base_domain = self._fuzzy_prelog_domain(
             program.id if program else False,
             selected_week,
             selected_version,
             unmatched_only=False,
-            include_removed=True,
+            include_removed=status == 'removed',
             import_job_id=import_job_id,
         )
-        prelogs = self.search(domain, order='airdate asc, scheduletime asc, id asc')
-        # Only the issue filters (time / length / ambiguous) depend on
-        # analysis-derived flags for ALREADY-ATTACHED rows. When none is
-        # active we skip that analysis for attached rows entirely and
-        # backfill it for just the visible page further down.
-        needs_attached_analysis = issue_filter in ('time', 'length', 'ambiguous')
-        all_rows = self._fuzzy_build_rows(
-            prelogs,
-            program,
+        count_domain = self._fuzzy_prelog_domain(
+            program.id if program else False,
             selected_week,
-            use_attached=True,
-            analyze_attached=needs_attached_analysis,
+            selected_version,
+            unmatched_only=False,
+            include_removed=False,
+            import_job_id=import_job_id,
         )
-        for row, prelog in zip(all_rows, prelogs):
-            self._fuzzy_classify_row(row, prelog)
-
-        # OVERRUN pass. One batched query resolves live attached-counts
-        # vs units_available for every schedule in the result set, then
-        # stamps the '+N' badge and promotes over-capacity rows to
-        # status 'overrun'. Covers BOTH already-attached rows (real
-        # overrun) and pending suggestions (projected overrun), and is
-        # scoped to the version currently in view.
-        self._fuzzy_apply_overrun_badges(all_rows, selected_version)
-
-        counts = {
-            'all': sum(row['status'] != 'removed' for row in all_rows),
-            'matched': sum(row['status'] == 'matched' for row in all_rows),
-            'unmatched': sum(
-                row['status'] in ('suggestion', 'no_suggestion')
-                for row in all_rows
-            ),
-            'suggestions': sum(row['status'] == 'suggestion' for row in all_rows),
-            'no_suggestion': sum(row['status'] == 'no_suggestion' for row in all_rows),
-            'removed': sum(row['status'] == 'removed' for row in all_rows),
-            'overruns': sum(row['status'] == 'overrun' for row in all_rows),
-        }
-        # TOTAL DOLLARS, per tab. `all_rows` is the whole scope already
-        # built in memory (that is what the counts above are summed
-        # from), so this is pure arithmetic - no extra query, and it is
-        # the FULL scope rather than the 200-row page.
-        dollars = self._fuzzy_dollar_totals(all_rows)
-        rows = self._fuzzy_filter_workbench_rows(
-            all_rows,
-            status=status,
-            search_term=search_term,
-            air_date=air_date,
-            issue_filter=issue_filter,
-            sort_by=sort_by,
-            sort_direction=sort_direction,
+        counts = self._prelog_stored_counts(count_domain)
+        dollars = self._prelog_stored_dollar_totals(count_domain)
+        domain = self._prelog_stored_domain(
+            base_domain, status, issue_filter, air_date, search_term,
         )
-        total = len(rows)
+        total = self.search_count(domain)
+        filtered_dollars = self._prelog_stored_rate_sum(domain)
         if total:
             offset = min(offset, ((total - 1) // limit) * limit)
         else:
             offset = 0
-        visible = rows[offset:offset + limit]
-        # Backfill the analysis-derived fields for the page the user is
-        # actually about to see. Everything outside this window stays
-        # un-analysed, which is what keeps a 100k-row view fast.
-        if not needs_attached_analysis:
-            self._fuzzy_enrich_visible_rows(
-                visible, program, selected_week,
-            )
+        prelogs = self.search(
+            domain,
+            order=self._prelog_stored_order(sort_by, sort_direction),
+            limit=limit,
+            offset=offset,
+        )
         return {
-            'rows': visible,
+            'rows': [self._prelog_stored_row(prelog) for prelog in prelogs],
             'total': total,
             'offset': offset,
             'limit': limit,
@@ -188,9 +157,7 @@ class MvPrelogDataFuzzyMatching(models.Model):
             # Dollar value of the CURRENT view (tab + search + air date
             # + issue filter), across every matching row, not just the
             # visible page.
-            'filtered_dollars': round(
-                sum(float(r.get('rate') or 0.0) for r in rows), 2,
-            ),
+            'filtered_dollars': filtered_dollars,
         }
 
     @api.model
@@ -639,14 +606,13 @@ class MvPrelogDataFuzzyMatching(models.Model):
                     for key in (
                         'network_match',
                         'deal_match',
-                        'rate_match',
                         'day_match',
                     )
                 ):
                     errors.append(
                         _(
                             '%(prelog)s: the suggested schedule no longer '
-                            'meets the network, deal, rate, and day criteria.'
+                            'meets the network, deal, and day criteria.'
                         )
                         % {'prelog': prelog.display_name}
                     )
@@ -654,12 +620,13 @@ class MvPrelogDataFuzzyMatching(models.Model):
                 if (
                     (
                         not analysis['time_match']
+                        or not analysis['rate_match']
                         or not analysis['length_match']
                     )
                     and not item['confirmed_override']
                 ):
                     errors.append(
-                        _('%(prelog)s: confirm the time or length mismatch before attaching.')
+                        _('%(prelog)s: confirm the time, rate, or length mismatch before attaching.')
                         % {'prelog': prelog.display_name}
                     )
                     continue
@@ -724,6 +691,10 @@ class MvPrelogDataFuzzyMatching(models.Model):
             prelog.write({
                 'schedule': schedule.id,
                 'import_match_status': 'matched',
+                'suggested_schedule': False,
+                'possible_schedules': False,
+                'match_flags': '',
+                'info': False,
                 'import_match_detail': detail,
             })
             touched_schedule_ids.add(schedule.id)
@@ -770,6 +741,7 @@ class MvPrelogDataFuzzyMatching(models.Model):
         """Implement remove/unremove for both explicit and all-page actions."""
         now = fields.Datetime.now()
         touched_schedule_ids = set()
+        restored = self.browse()
         for prelog in prelogs:
             previous_schedule_id = prelog.schedule.id if prelog.schedule else False
             previous_schedule = prelog.schedule.display_name if prelog.schedule else ''
@@ -798,11 +770,20 @@ class MvPrelogDataFuzzyMatching(models.Model):
             prelog.write({
                 'removed': removed,
                 'schedule': False,
-                'import_match_status': 'created_without_schedule',
+                'import_match_status': 'unmatched',
+                'suggested_schedule': False,
+                'possible_schedules': False,
+                'match_flags': False,
+                'info': False,
                 'import_match_detail': detail,
             })
             if previous_schedule_id:
                 touched_schedule_ids.add(previous_schedule_id)
+            if not removed:
+                restored |= prelog
+
+        if restored:
+            self._prelog_store_matching(restored, False, False, attach=True)
 
         # Any schedule that lost an attachment needs its overrun recomputed.
         self._fuzzy_set_removed_records_recalc_hook(touched_schedule_ids)
@@ -943,11 +924,17 @@ class MvPrelogDataFuzzyMatching(models.Model):
             }
             prelog.write({
                 'schedule': False,
-                'import_match_status': 'created_without_schedule',
+                'import_match_status': 'unmatched',
                 'import_match_detail': '\n'.join(
                     part for part in (prelog.import_match_detail, line) if part
                 ),
             })
+            self._prelog_store_matching(
+                prelog,
+                prelog.import_program,
+                prelog.import_week_value,
+                attach=False,
+            )
             touched_schedule_ids.add(prev_id)
             detached += 1
         if touched_schedule_ids:
@@ -955,6 +942,88 @@ class MvPrelogDataFuzzyMatching(models.Model):
         return {
             'updated': detached,
             'message': _('%(count)s schedule(s) detached.') % {'count': detached},
+        }
+
+    @api.model
+    def fuzzy_match_row(self, prelog_id):
+        """Return one stored row so an open Review drawer can be refreshed."""
+        self._fuzzy_check_access()
+        prelog = self.browse(self._fuzzy_int(prelog_id)).exists()
+        return self._prelog_stored_row(prelog) if prelog else False
+
+    @api.model
+    def fuzzy_match_refresh(
+        self,
+        program_id=False,
+        week_start=False,
+        version=False,
+        import_job_id=False,
+    ):
+        """Re-run the import matcher for stored unmatched rows only.
+
+        This picks up Schedule corrections without recalculating anything during
+        an ordinary page load. Existing attachments are never changed.
+        """
+        self._fuzzy_check_access()
+        program, selected_week, selected_version = (
+            self._fuzzy_validate_optional_filters(
+                program_id, week_start, version,
+            )
+        )
+        domain = self._fuzzy_prelog_domain(
+            program.id if program else False,
+            selected_week,
+            selected_version,
+            unmatched_only=False,
+            include_removed=False,
+            import_job_id=import_job_id,
+        ) + [('import_match_status', '=', 'unmatched')]
+        prelogs = self.search(domain)
+        if not prelogs:
+            return {
+                'checked': 0,
+                'attached': 0,
+                'unmatched': 0,
+                'message': _('Nothing to re-check - no unmatched Prelog rows.'),
+            }
+
+        touched_before = set(prelogs.mapped('schedule').ids)
+        self._prelog_store_matching(
+            prelogs, program, selected_week, attach=True,
+        )
+        attached = prelogs.filtered('schedule')
+        touched_after = set(attached.mapped('schedule').ids)
+        if touched_before or touched_after:
+            self._recompute_prelog_overruns(touched_before | touched_after)
+
+        if attached:
+            now = fields.Datetime.now()
+            for prelog in attached:
+                line = _(
+                    'Schedule %(schedule)s attached by Refresh in Prelog '
+                    'Workbench by %(user)s on %(date)s - Schedule corrected '
+                    'after import.'
+                ) % {
+                    'schedule': prelog.schedule.display_name,
+                    'user': self.env.user.display_name,
+                    'date': fields.Datetime.to_string(now),
+                }
+                prelog.import_match_detail = '\n'.join(
+                    part for part in (prelog.import_match_detail, line) if part
+                )
+
+        return {
+            'checked': len(prelogs),
+            'attached': len(attached),
+            'unmatched': len(prelogs) - len(attached),
+            'message': _(
+                'Re-checked %(checked)s row(s): %(attached)s attached, '
+                '%(unmatched)s still unmatched.'
+            ) % {
+                'checked': len(prelogs),
+                'attached': len(attached),
+                'unmatched': len(prelogs) - len(attached),
+            },
         }
 
     @api.model
@@ -1056,45 +1125,38 @@ class MvPrelogDataFuzzyMatching(models.Model):
             program_id, week_start, version
         )
         prelogs = self.search(
-            self._fuzzy_prelog_domain(
-                program.id if program else False,
-                selected_week,
-                selected_version,
-                unmatched_only=False,
-                include_removed=True,
-                import_job_id=import_job_id,
+            self._prelog_stored_domain(
+                self._fuzzy_prelog_domain(
+                    program.id if program else False,
+                    selected_week,
+                    selected_version,
+                    unmatched_only=False,
+                    include_removed=status == 'removed',
+                    import_job_id=import_job_id,
+                ),
+                status,
+                issue_filter,
+                air_date,
+                search_term,
             ),
-            order='airdate asc, scheduletime asc, id asc',
+            order=self._prelog_stored_order(sort_by, sort_direction),
         )
-        rows = self._fuzzy_build_rows(
-            prelogs, program, selected_week, use_attached=True
-        )
-        for row, prelog in zip(rows, prelogs):
-            self._fuzzy_classify_row(row, prelog)
-        rows = self._fuzzy_filter_workbench_rows(
-            rows,
-            status=status,
-            search_term=search_term,
-            air_date=air_date,
-            issue_filter=issue_filter,
-            sort_by=sort_by,
-            sort_direction=sort_direction,
-        )
+        rows = [self._prelog_stored_row(prelog) for prelog in prelogs]
 
         output = io.StringIO(newline='')
         writer = csv.writer(output)
         writer.writerow([
             'Prelog', 'Status', 'Match Quality', 'Network', 'Air Date',
             'Air Time', 'Length', 'Rate', 'Week', 'Network Deal #',
-            'Adv/Product', 'Schedule', 'Reason',
+            'Adv/Product', 'Schedule', 'Info',
         ])
         for row in rows:
-            schedule = row.get('attached') or row.get('suggested') or {}
+            schedule = row.get('attached') or {}
             writer.writerow(self._fuzzy_csv_row([
                 row['name'], row['status_label'], row['match_quality_label'],
                 row['network'], row['air_date'], row['air_time'], row['length'],
                 row['rate'], row['week'], row['deal_number'],
-                row['advertiser_product'], schedule.get('name', ''), row['reason'],
+                row['advertiser_product'], schedule.get('name', ''), row['info'],
             ]))
         safe_program = re.sub(
             r'[^A-Za-z0-9_-]+',
@@ -1244,6 +1306,460 @@ class MvPrelogDataFuzzyMatching(models.Model):
         if import_job_id:
             domain.append(('import_job', '=', self._fuzzy_int(import_job_id)))
         return domain
+
+    # ------------------------------------------------------------------
+    # Stored matching, written by import and explicit Refresh
+    # ------------------------------------------------------------------
+
+    _PRELOG_FLAG_TOKENS = (
+        'day', 'time', 'time_buffer', 'rate', 'length', 'ambiguous',
+        'missing_deal', 'missing_air_date', 'missing_air_time',
+        'no_schedules', 'network',
+    )
+
+    _PRELOG_FLAG_DOMAIN = {
+        'day': ('day',),
+        'time': ('time', 'time_buffer', 'missing_air_time'),
+        'length': ('length',),
+        'rate': ('rate',),
+        'ambiguous': ('ambiguous',),
+        'missing_deal': ('missing_deal',),
+    }
+
+    _PRELOG_SORT_COLUMNS = {
+        'air_date': 'airdate %(d)s, scheduletime %(d)s, id %(d)s',
+        'name': 'name %(d)s, id %(d)s',
+        'network': 'broadcast_network %(d)s, network %(d)s, id %(d)s',
+        'length': 'schedulelength %(d)s, id %(d)s',
+        'rate': 'rate %(d)s, id %(d)s',
+        'deal_number': 'network_deal_number %(d)s, id %(d)s',
+        'advertiser_product': 'advertiserproduct %(d)s, id %(d)s',
+        'status': 'import_match_status %(d)s, is_overrun %(d)s, id %(d)s',
+        'schedule': 'schedule %(d)s, id %(d)s',
+        'info': 'info %(d)s, id %(d)s',
+        # Compatibility with clients loaded before the Reason -> Info rename.
+        'reason': 'info %(d)s, id %(d)s',
+    }
+
+    @api.model
+    def _prelog_flags(self, tokens):
+        unknown = [token for token in tokens if token not in self._PRELOG_FLAG_TOKENS]
+        if unknown:
+            raise ValueError('Unknown match flag(s): %s' % ', '.join(unknown))
+        return (',%s,' % ','.join(tokens)) if tokens else ''
+
+    @api.model
+    def _prelog_analysis_flags(self, analysis):
+        tokens = []
+        if not analysis['day_match']:
+            tokens.append('day')
+        if not analysis['exact_time_match']:
+            tokens.append('time_buffer' if analysis['time_match'] else 'time')
+        if not analysis['rate_match']:
+            tokens.append('rate')
+        if not analysis['length_match']:
+            tokens.append('length')
+        return tokens
+
+    @api.model
+    def _prelog_candidate_payload(self, analysis):
+        payload = self._fuzzy_schedule_payload(analysis['schedule'])
+        flags = self._prelog_analysis_flags(analysis)
+        payload.update({
+            'flags': self._prelog_flags(flags),
+            'why': ', '.join(flags) or _('matches on every check'),
+            'attachable': analysis['schedule'].status == 'sold',
+            'day_mismatch': not analysis['day_match'],
+            'time_mismatch': not analysis['time_match'],
+            'rate_mismatch': not analysis['rate_match'],
+            'length_mismatch': not analysis['length_match'],
+            'time_distance': analysis['time_distance'],
+            'exact_time_match': analysis['exact_time_match'],
+            'exact': not flags,
+        })
+        return payload
+
+    @api.model
+    def _prelog_store_matching(self, prelogs, program, week, attach=True):
+        """Persist attachment, suggestions, flags and Info for each row."""
+        groups = {}
+        contexts = {}
+        for prelog in prelogs.filtered(lambda row: not row.removed):
+            row_program = prelog.import_program or program
+            row_week = prelog.import_week_value or week
+            key = (
+                prelog.version,
+                row_program.id if row_program else False,
+                row_week,
+            )
+            groups.setdefault(key, []).append(prelog.id)
+            contexts[key] = (row_program, row_week)
+
+        counts = {'matched': 0, 'unmatched': 0}
+        for key, grouped_ids in groups.items():
+            row_program, row_week = contexts[key]
+            part = self._prelog_store_matching_group(
+                self.browse(grouped_ids), row_program, row_week, attach=attach,
+            )
+            counts['matched'] += part['matched']
+            counts['unmatched'] += part['unmatched']
+        return counts
+
+    @api.model
+    def _prelog_store_matching_group(self, prelogs, program, week, attach=True):
+        if not program or not week:
+            return {'matched': 0, 'unmatched': 0}
+
+        candidate_map = self._fuzzy_candidate_map(prelogs, program, week)
+        accepted_networks = self._fuzzy_network_names(program)
+        counts = {'matched': 0, 'unmatched': 0}
+
+        for prelog in prelogs:
+            deal_number = (prelog.network_deal_number or '').strip()
+            if not deal_number:
+                prelog.write(self._prelog_unresolved_vals('missing_deal'))
+                counts['unmatched'] += 1
+                continue
+            if not prelog.airdate:
+                prelog.write(self._prelog_unresolved_vals('missing_air_date'))
+                counts['unmatched'] += 1
+                continue
+            if not (prelog.scheduletime or '').strip():
+                prelog.write(self._prelog_unresolved_vals('missing_air_time'))
+                counts['unmatched'] += 1
+                continue
+
+            analyses = [
+                self._fuzzy_analyze_schedule(
+                    prelog, program, schedule, accepted_networks,
+                )
+                for schedule in candidate_map.get(deal_number, [])
+            ]
+            eligible = [
+                analysis for analysis in analyses
+                if (
+                    analysis['network_match']
+                    and analysis['day_match']
+                )
+            ]
+            if not eligible:
+                token = self._prelog_no_suggestion_token(analyses)
+                prelog.write(self._prelog_unresolved_vals(token))
+                counts['unmatched'] += 1
+                continue
+
+            eligible.sort(key=self._fuzzy_analysis_sort_key)
+            best = eligible[0]
+            winning_key = self._fuzzy_analysis_quality_key(best)
+            tied = sum(
+                1 for analysis in eligible
+                if self._fuzzy_analysis_quality_key(analysis) == winning_key
+            )
+            flags = self._prelog_analysis_flags(best)
+            if tied > 1:
+                flags = flags + ['ambiguous']
+            is_clean = not flags
+
+            if attach and is_clean and best['schedule'].status == 'sold':
+                prelog.write({
+                    'schedule': best['schedule'].id,
+                    'suggested_schedule': False,
+                    'possible_schedules': False,
+                    'match_flags': self._prelog_flags(flags),
+                    'info': False,
+                    'import_match_status': 'matched',
+                })
+                counts['matched'] += 1
+                continue
+
+            offered = [
+                analysis
+                for analysis in eligible
+                if len(self._prelog_analysis_flags(analysis))
+                <= self._FUZZY_MAX_ALTERNATIVE_DIFFERENCES
+            ][:self._FUZZY_MAX_ALTERNATIVES + 1] or [best]
+            prelog.write({
+                'schedule': False,
+                'suggested_schedule': best['schedule'].id,
+                'possible_schedules': [
+                    self._prelog_candidate_payload(analysis)
+                    for analysis in offered
+                ],
+                'match_flags': self._prelog_flags(flags),
+                'info': self._prelog_info_text(flags, len(offered)),
+                'import_match_status': 'unmatched',
+                'is_overrun': False,
+            })
+            counts['unmatched'] += 1
+
+        return counts
+
+    @api.model
+    def _prelog_no_suggestion_token(self, analyses):
+        if not analyses:
+            return 'no_schedules'
+        network_matches = [a for a in analyses if a['network_match']]
+        if not network_matches:
+            return 'network'
+        if not any(a['day_match'] for a in network_matches):
+            return 'day'
+        return 'time'
+
+    @api.model
+    def _prelog_info_text(self, flags, suggestion_count):
+        labels = {
+            'missing_deal': _('Missing deal number'),
+            'missing_air_date': _('Missing air date'),
+            'missing_air_time': _('Missing air time'),
+            'no_schedules': _('No schedules found for deal number'),
+            'network': _('No network match'),
+            'rate': _('No rate match'),
+            'day': _('No day match'),
+            'time': _('No time match'),
+        }
+        for token in (
+            'missing_deal', 'missing_air_date', 'missing_air_time',
+            'no_schedules', 'network', 'rate', 'day',
+        ):
+            if token in flags and not suggestion_count:
+                return labels[token]
+        if suggestion_count:
+            return _('%(count)s suggestion(s)') % {'count': suggestion_count}
+        return labels.get(flags[0], '') if flags else ''
+
+    @api.model
+    def _prelog_unresolved_vals(self, token):
+        return {
+            'schedule': False,
+            'suggested_schedule': False,
+            'possible_schedules': False,
+            'import_match_status': 'unmatched',
+            'match_flags': self._prelog_flags([token]),
+            'info': self._prelog_info_text([token], 0),
+            'is_overrun': False,
+        }
+
+    @api.model
+    def _prelog_stored_order(self, sort_by, sort_direction):
+        direction = 'desc' if str(sort_direction).lower() == 'desc' else 'asc'
+        template = self._PRELOG_SORT_COLUMNS.get(
+            sort_by, self._PRELOG_SORT_COLUMNS['air_date'],
+        )
+        return template % {'d': direction}
+
+    @api.model
+    def _prelog_stored_domain(
+        self, base_domain, status, issue_filter, air_date, search_term,
+    ):
+        domain = list(base_domain)
+        if status == 'matched':
+            domain += [
+                ('import_match_status', '=', 'matched'),
+                ('is_overrun', '=', False),
+            ]
+        elif status == 'unmatched':
+            domain += [('import_match_status', '=', 'unmatched')]
+        elif status == 'suggestions':
+            domain += [
+                ('import_match_status', '=', 'unmatched'),
+                ('suggested_schedule', '!=', False),
+            ]
+        elif status == 'no_suggestion':
+            domain += [
+                ('import_match_status', '=', 'unmatched'),
+                ('suggested_schedule', '=', False),
+            ]
+        elif status == 'removed':
+            domain = [term for term in domain if term != ('removed', '=', False)]
+            domain += [('removed', '=', True)]
+        elif status == 'overruns':
+            domain += [('is_overrun', '=', True)]
+
+        tokens = self._PRELOG_FLAG_DOMAIN.get(issue_filter)
+        if tokens:
+            domain += ['|'] * (len(tokens) - 1)
+            domain += [
+                ('match_flags', 'ilike', ',%s,' % token) for token in tokens
+            ]
+
+        if air_date:
+            try:
+                parsed = fields.Date.to_date(air_date)
+            except (TypeError, ValueError):
+                parsed = False
+            if parsed:
+                domain += [('airdate', '=', parsed)]
+
+        term = (search_term or '').strip()
+        if term:
+            domain += [
+                '|', '|', '|', '|',
+                ('name', 'ilike', term),
+                ('advertiserproduct', 'ilike', term),
+                ('network_deal_number', 'ilike', term),
+                ('schedule.name', 'ilike', term),
+                ('suggested_schedule.name', 'ilike', term),
+            ]
+        return domain
+
+    @api.model
+    def _prelog_stored_counts(self, base_domain):
+        counts = {
+            'all': 0,
+            'matched': 0,
+            'unmatched': 0,
+            'suggestions': 0,
+            'no_suggestion': 0,
+            'removed': 0,
+            'overruns': 0,
+        }
+        counts['removed'] = self.search_count(
+            [term for term in base_domain if term != ('removed', '=', False)]
+            + [('removed', '=', True)]
+        )
+        groups = self._read_group(
+            base_domain,
+            ['import_match_status', 'is_overrun'],
+            ['__count'],
+        )
+        for status, is_overrun, count in groups:
+            counts['all'] += count
+            if status == 'unmatched':
+                counts['unmatched'] += count
+            elif is_overrun:
+                counts['overruns'] += count
+            elif status == 'matched':
+                counts['matched'] += count
+        counts['suggestions'] = self.search_count(
+            base_domain
+            + [('import_match_status', '=', 'unmatched')]
+            + [('suggested_schedule', '!=', False)]
+        )
+        counts['no_suggestion'] = counts['unmatched'] - counts['suggestions']
+        return counts
+
+    @api.model
+    def _prelog_stored_rate_sum(self, domain):
+        """Return a database-backed rate total without loading result rows."""
+        groups = self._read_group(domain, [], ['rate:sum'])
+        return round(float(groups[0][0] or 0.0), 2) if groups else 0.0
+
+    @api.model
+    def _prelog_stored_dollar_totals(self, base_domain):
+        """Return full-scope rate totals for each stored Workbench tab."""
+        totals = {
+            'all': 0.0,
+            'matched': 0.0,
+            'unmatched': 0.0,
+            'suggestions': 0.0,
+            'no_suggestion': 0.0,
+            'removed': 0.0,
+            'overruns': 0.0,
+        }
+        groups = self._read_group(
+            base_domain,
+            ['import_match_status', 'is_overrun', 'suggested_schedule'],
+            ['rate:sum'],
+        )
+        for status, is_overrun, suggested_schedule, rate_sum in groups:
+            amount = float(rate_sum or 0.0)
+            totals['all'] += amount
+            if status == 'unmatched':
+                totals['unmatched'] += amount
+                bucket = 'suggestions' if suggested_schedule else 'no_suggestion'
+                totals[bucket] += amount
+            elif is_overrun:
+                totals['overruns'] += amount
+            elif status == 'matched':
+                totals['matched'] += amount
+
+        removed_domain = [
+            term for term in base_domain if term != ('removed', '=', False)
+        ] + [('removed', '=', True)]
+        totals['removed'] = self._prelog_stored_rate_sum(removed_domain)
+        return {key: round(value, 2) for key, value in totals.items()}
+
+    @api.model
+    def _prelog_stored_row(self, prelog):
+        candidates = list(prelog.possible_schedules or [])
+        flags = [token for token in (prelog.match_flags or '').split(',') if token]
+        suggested = candidates[0] if candidates else (
+            self._fuzzy_schedule_payload(prelog.suggested_schedule)
+            if prelog.suggested_schedule else False
+        )
+        attached = (
+            self._fuzzy_schedule_payload(prelog.schedule)
+            if prelog.schedule else False
+        )
+
+        if prelog.removed:
+            status = 'removed'
+        elif prelog.is_overrun:
+            status = 'overrun'
+        elif prelog.import_match_status == 'matched' and prelog.schedule:
+            status = 'matched'
+        elif prelog.suggested_schedule:
+            status = 'suggestion'
+        else:
+            status = 'no_suggestion'
+
+        hard = [flag for flag in flags if flag != 'ambiguous']
+        return {
+            'id': prelog.id,
+            'name': prelog.display_name or '',
+            'network': (
+                prelog.broadcast_network
+                or prelog.network
+                or (prelog.import_program.display_name if prelog.import_program else '')
+                or ''
+            ),
+            'version': prelog.version or '',
+            'air_date': fields.Date.to_string(prelog.airdate) if prelog.airdate else '',
+            'day': prelog.airdate.strftime('%a') if prelog.airdate else '',
+            'air_time': prelog.scheduletime or '',
+            'length': prelog.schedulelength or '',
+            'rate': prelog.rate or 0.0,
+            'week': (
+                fields.Date.to_string(prelog.import_week_value)
+                if prelog.import_week_value else ''
+            ),
+            'deal_number': prelog.network_deal_number or '',
+            'advertiser_product': prelog.advertiserproduct or '',
+            'agency': prelog.agency or '',
+            'title': prelog.title or '',
+            'import_job_name': prelog.import_job.name if prelog.import_job else '',
+            'match_detail': prelog.import_match_detail or '',
+            'info': prelog.info or '',
+            # Kept for the existing Review drawer while the list column is Info.
+            'reason': prelog.info or '',
+            'status': status,
+            'status_label': {
+                'matched': _('Matched'),
+                'removed': _('Removed'),
+                'overrun': _('Overrun'),
+            }.get(status, _('Unmatched')),
+            'removed': bool(prelog.removed),
+            'is_overrun': bool(prelog.is_overrun),
+            'attached': attached,
+            'suggested': suggested,
+            'alternatives': candidates[1:],
+            'suggestion_attachable': bool(prelog.suggested_schedule)
+            and prelog.suggested_schedule.status == 'sold',
+            'match_quality': '' if not suggested else ('exact' if not hard else 'fuzzy'),
+            'match_quality_label': '' if not suggested else (
+                _('Exact') if not hard else _('Fuzzy')
+            ),
+            'explanation': prelog.info or '',
+            'ambiguous_count': 2 if 'ambiguous' in flags else 1,
+            'day_mismatch': 'day' in flags,
+            'time_mismatch': 'time' in flags or 'time_buffer' in flags,
+            'rate_mismatch': 'rate' in flags,
+            'length_mismatch': 'length' in flags,
+            'network_mismatch': 'network' in flags,
+            'deal_mismatch': 'no_schedules' in flags or 'missing_deal' in flags,
+            'time_distance': (suggested or {}).get('time_distance'),
+            'exact_time_match': 'time' not in flags and 'time_buffer' not in flags,
+        }
 
     @api.model
     def _fuzzy_overrun_map(self, schedule_ids, selected_version=False):
@@ -1684,35 +2200,24 @@ class MvPrelogDataFuzzyMatching(models.Model):
         program, selected_week, selected_version = (
             self._fuzzy_validate_optional_filters(program_id, week_start, version)
         )
-        prelogs = self.search(
-            self._fuzzy_prelog_domain(
-                program.id if program else False,
-                selected_week,
-                selected_version,
-                unmatched_only=False,
-                include_removed=True,
-                import_job_id=import_job_id,
+        filtered = self.search(
+            self._prelog_stored_domain(
+                self._fuzzy_prelog_domain(
+                    program.id if program else False,
+                    selected_week,
+                    selected_version,
+                    unmatched_only=False,
+                    include_removed=status == 'removed',
+                    import_job_id=import_job_id,
+                ),
+                status,
+                issue_filter,
+                air_date,
+                search_term,
             ),
-            order='airdate asc, scheduletime asc, id asc',
+            order=self._prelog_stored_order(sort_by, sort_direction),
         )
-        rows = self._fuzzy_build_rows(
-            prelogs,
-            program,
-            selected_week,
-            use_attached=True,
-        )
-        for row, prelog in zip(rows, prelogs):
-            self._fuzzy_classify_row(row, prelog)
-        filtered_rows = self._fuzzy_filter_workbench_rows(
-            rows,
-            status=status,
-            search_term=search_term,
-            air_date=air_date,
-            issue_filter=issue_filter,
-            sort_by=sort_by,
-            sort_direction=sort_direction,
-        )
-        filtered_ids = [row['id'] for row in filtered_rows]
+        filtered_ids = filtered.ids
         filtered_id_set = set(filtered_ids)
         if selection.get('all_matching'):
             excluded_ids = {
@@ -1735,13 +2240,10 @@ class MvPrelogDataFuzzyMatching(models.Model):
                 )
         if not selected_ids:
             raise UserError(_('Select at least one Prelog Data row.'))
-        selected_set = set(selected_ids)
-        selected_rows = [
-            row for row in filtered_rows if row['id'] in selected_set
-        ]
-        # browse() once - the previous `recordset |= record` loop was
-        # O(n^2) and could dominate a large bulk selection.
         selected_prelogs = self.browse(selected_ids)
+        selected_rows = [
+            self._prelog_stored_row(prelog) for prelog in selected_prelogs
+        ]
         return selected_prelogs, selected_rows
 
     @api.model
@@ -1824,6 +2326,7 @@ class MvPrelogDataFuzzyMatching(models.Model):
             ('week', '=', selected_week),
             ('deal_parent.program', '=', program.id),
             ('deal_parent.network_deal_number', 'in', deal_numbers),
+            ('status', '=', 'sold'),
         ], order='id')
         result = {}
         for schedule in schedules:
@@ -1883,7 +2386,6 @@ class MvPrelogDataFuzzyMatching(models.Model):
                 for analysis in analyses
                 if (
                     analysis['network_match']
-                    and analysis['rate_match']
                     and analysis['day_match']
                 )
             ]
@@ -2107,35 +2609,9 @@ class MvPrelogDataFuzzyMatching(models.Model):
         ]
         if not network_matches:
             return _('No network match')
-        rate_matches = [
-            analysis
-            for analysis in network_matches
-            if analysis['rate_match']
-        ]
-        if not rate_matches:
-            # Include actual rates so the user can immediately see the
-            # gap. Candidates that survived the network filter but
-            # failed rate are listed with their (schedule_name, rate).
-            candidate_bits = [
-                '%s=$%.2f' % (
-                    analysis['schedule'].display_name or '?',
-                    analysis['schedule'].rate or 0.0,
-                )
-                for analysis in network_matches[:5]
-            ]
-            prelog_rate = (
-                '$%.2f' % (prelog.rate or 0.0)
-                if prelog is not None else '?'
-            )
-            return _(
-                'No rate match (prelog=%(prelog)s; candidates: %(cands)s)'
-            ) % {
-                'prelog': prelog_rate,
-                'cands': ', '.join(candidate_bits) or '(none)',
-            }
         day_matches = [
             analysis
-            for analysis in rate_matches
+            for analysis in network_matches
             if analysis['day_match']
         ]
         if not day_matches:
@@ -2147,12 +2623,16 @@ class MvPrelogDataFuzzyMatching(models.Model):
         schedule = analysis['schedule']
         return (
             self._fuzzy_status_priority(schedule.status),
-            0 if analysis['time_match'] else 1,
+            # Rotation is the strongest fuzzy signal after Program/deal/day.
+            # In particular, an incorrect schedule rate must not make a
+            # nearby but out-of-rotation schedule outrank the correct window.
+            0 if analysis['exact_time_match'] else 1,
             (
                 analysis['time_distance']
                 if analysis['time_distance'] is not None
                 else 10 ** 9
             ),
+            0 if analysis['rate_match'] else 1,
             0 if analysis['length_match'] else 1,
             schedule.display_name or '',
             schedule.id,
@@ -2163,9 +2643,10 @@ class MvPrelogDataFuzzyMatching(models.Model):
         schedule = analysis['schedule']
         return (
             self._fuzzy_status_priority(schedule.status),
-            bool(analysis['time_match']),
+            0 if analysis['exact_time_match'] else 1,
             analysis['time_distance'],
-            bool(analysis['length_match']),
+            0 if analysis['rate_match'] else 1,
+            0 if analysis['length_match'] else 1,
         )
 
     @api.model

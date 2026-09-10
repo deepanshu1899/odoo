@@ -2,7 +2,7 @@
 
 import { registry } from "@web/core/registry";
 import { useService } from "@web/core/utils/hooks";
-import { Component, onWillStart, useState } from "@odoo/owl";
+import { Component, onWillStart, onWillUnmount, useState } from "@odoo/owl";
 
 export class MvPrelogFuzzyMatching extends Component {
     static template = "marathon_ventures.MvPrelogFuzzyMatching";
@@ -12,7 +12,9 @@ export class MvPrelogFuzzyMatching extends Component {
         this.orm = useService("orm");
         this.action = useService("action");
         this.notification = useService("notification");
+        onWillUnmount(() => { this.isUnmounted = true; });
         this.requestId = 0;
+        this.isUnmounted = false;
         this.state = useState({
             loaded: false,
             querying: false,
@@ -39,6 +41,8 @@ export class MvPrelogFuzzyMatching extends Component {
             searchTerm: "",
             airDate: "",
             issueFilter: "",
+            refreshing: false,
+            importJob: false,
             sortBy: "air_date",
             sortDirection: "asc",
             rows: [],
@@ -367,6 +371,107 @@ export class MvPrelogFuzzyMatching extends Component {
         } finally { this.state.mutating = false; }
     }
 
+    get importInFlight() {
+        return Boolean(this.state.importJob);
+    }
+
+    async onImport() {
+        const latest = await this.orm.search("mv.prelog_import_job", [], {
+            limit: 1, order: "id desc",
+        });
+        const previousId = latest.length ? latest[0] : 0;
+        await this.action.doAction(
+            "marathon_ventures.action_open_prelog_import_wizard",
+            { onClose: () => { this._watchImportJob(previousId); } },
+        );
+    }
+
+    clearResultsForImport() {
+        this.closeDrawer();
+        Object.assign(this.state, {
+            rows: [], total: 0, offset: 0, page: 0, pages: 0,
+            counts: {
+                all: 0, matched: 0, unmatched: 0, suggestions: 0,
+                no_suggestion: 0, removed: 0, overruns: 0,
+            },
+            selectedRows: {}, selectAllMatching: false, excludedRows: {},
+        });
+    }
+
+    async _watchImportJob(previousId) {
+        const created = await this.orm.searchRead(
+            "mv.prelog_import_job", [["id", ">", previousId]], ["state"],
+            { limit: 1, order: "id desc" },
+        );
+        if (!created.length) return;
+
+        const jobId = created[0].id;
+        this.clearResultsForImport();
+        const fields = [
+            "state", "total_row_count", "matched_count", "unmatched_count",
+            "error_count", "failure_message", "program_id", "import_week",
+            "prelog_version",
+        ];
+        const deadline = Date.now() + 10 * 60 * 1000;
+        while (!this.isUnmounted && Date.now() < deadline) {
+            const [job] = await this.orm.read(
+                "mv.prelog_import_job", [jobId], fields,
+            );
+            this.state.importJob = job;
+            if (job.state === "completed" || job.state === "failed") break;
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+        if (this.isUnmounted) return;
+
+        const job = this.state.importJob;
+        if (job && job.state === "completed") {
+            this.notification.add(
+                `Import finished: ${job.total_row_count} row(s), ` +
+                `${job.matched_count} matched, ${job.unmatched_count} unmatched.`,
+                { type: "success" },
+            );
+            if (job.program_id) this.state.filters.programId = job.program_id[0];
+            if (job.import_week) this.state.filters.weekStart = job.import_week;
+            if (job.prelog_version) {
+                this.state.filters.version = job.prelog_version;
+                await this._refreshVersions(job.prelog_version);
+            }
+            this.state.filters.importJobId = jobId;
+            await this._loadResults();
+        } else if (job && job.state === "failed") {
+            this.notification.add(
+                job.failure_message || "The import failed.", { type: "danger" },
+            );
+            await this._loadResults();
+        } else {
+            this.notification.add(
+                "The import is still running. Press View Prelogs when it finishes.",
+                { type: "info" },
+            );
+            await this._loadResults();
+        }
+        this.state.importJob = false;
+    }
+
+    async onRefresh() {
+        const f = this.state.filters;
+        this.state.refreshing = true;
+        try {
+            const result = await this.orm.call(
+                "mv.prelog_data", "fuzzy_match_refresh", [
+                    f.programId || false, f.weekStart || false,
+                    f.version || false, f.importJobId || false,
+                ],
+            );
+            this.notification.add(result.message, {
+                type: result.attached ? "success" : "info",
+            });
+            await this._loadResults();
+        } finally {
+            this.state.refreshing = false;
+        }
+    }
+
     async detachSchedule(row) {
         if (!window.confirm(`Detach ${row.attached?.name || "the schedule"} from this Prelog row?`)) return;
         const f = this.state.filters;
@@ -379,6 +484,17 @@ export class MvPrelogFuzzyMatching extends Component {
             this.state.drawerRow = false;
             await this._loadResults();
         } finally { this.state.mutating = false; }
+    }
+
+    async attachAlternative(row, alternative) {
+        if (!window.confirm(`Attach ${alternative.name} to ${row.name}?`)) return;
+        await this._applySchedules([{
+            prelog_id: row.id,
+            schedule_id: alternative.id,
+            source: "manual",
+            confirmed_override: true,
+            replace_existing: false,
+        }]);
     }
 
     async attachManual(row) {
@@ -523,6 +639,102 @@ export class MvPrelogFuzzyMatching extends Component {
         return `fa fa-sort-${direction} mv-fuzzy__sort-icon is-active`;
     }
 
+    candidates() {
+        const row = this.state.drawerRow;
+        if (!row || !row.suggested) return [];
+        const shape = (schedule, flags, extra) => ({
+            schedule,
+            day_mismatch: Boolean(flags.day_mismatch),
+            rate_mismatch: Boolean(flags.rate_mismatch),
+            length_mismatch: Boolean(flags.length_mismatch),
+            time_distance: flags.time_distance,
+            exact_time_match: Boolean(flags.exact_time_match),
+            ...extra,
+        });
+        return [
+            shape(row.suggested, row, {
+                suggested: true,
+                attachable: row.suggestion_attachable,
+                alternative: null,
+            }),
+            ...(row.alternatives || []).map((alternative) =>
+                shape(alternative, alternative, {
+                    suggested: false,
+                    attachable: alternative.attachable,
+                    alternative,
+                })
+            ),
+        ];
+    }
+
+    rateDelta(schedule) {
+        const prelogRate = Number(this.state.drawerRow?.rate ?? 0);
+        const scheduleRate = Number(schedule?.rate ?? 0);
+        const difference = scheduleRate - prelogRate;
+        if (!Number.isFinite(difference) || Math.abs(difference) < 0.005) return "";
+        return `${difference > 0 ? "+" : "-"}$${this.formatRate(Math.abs(difference))}`;
+    }
+
+    differenceSummary(candidate) {
+        const parts = [];
+        // Rate appears first so an incorrectly entered schedule rate is the
+        // first warning Operations sees, even when rotation drives the rank.
+        if (candidate.rate_mismatch) {
+            const delta = this.rateDelta(candidate.schedule);
+            parts.push(delta ? `Rate mismatch (${delta})` : "Rate mismatch");
+        }
+        if (!candidate.exact_time_match) {
+            const distance = candidate.time_distance;
+            const howFar = distance === null || distance === undefined || distance === false
+                ? "Outside rotation"
+                : `${distance} min outside rotation`;
+            parts.push(`${howFar} - ${this.state.drawerRow?.air_time || "unknown time"}`);
+        }
+        if (candidate.day_mismatch) {
+            const day = this.spotDayName();
+            parts.push(day ? `Day not allowed - ${day}` : "Day not allowed");
+        }
+        if (candidate.length_mismatch) {
+            parts.push(`Length mismatch (${candidate.schedule.length || "unknown"})`);
+        }
+        return {
+            count: parts.length,
+            label: parts.length
+                ? `${parts.length} difference${parts.length === 1 ? "" : "s"}`
+                : "Exact match",
+            parts,
+        };
+    }
+
+    weekdayName(value) {
+        const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value || ""));
+        if (!match) return "";
+        const localDate = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+        return Number.isNaN(localDate.getTime())
+            ? ""
+            : localDate.toLocaleDateString(undefined, { weekday: "long" });
+    }
+
+    spotDayName() {
+        const row = this.state.drawerRow;
+        return this.weekdayName(row?.air_date) || row?.day || "";
+    }
+
+    condenseDays(value) {
+        const order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        const parts = String(value || "").split(",").map((day) => day.trim()).filter(Boolean);
+        if (parts.length < 3) return parts.join(", ") || "—";
+        const indexes = parts.map((day) => order.indexOf(day.slice(0, 3)));
+        if (indexes.some((index) => index < 0)) return parts.join(", ");
+        const sorted = [...indexes].sort((a, b) => a - b);
+        const contiguous = sorted.every(
+            (value, index) => index === 0 || value === sorted[index - 1] + 1,
+        );
+        return contiguous
+            ? `${order[sorted[0]]}–${order[sorted[sorted.length - 1]]}`
+            : parts.join(", ");
+    }
+
     formatRate(value) {
         const number = Number(value || 0);
         return Number.isFinite(number) ? number.toLocaleString(undefined, {
@@ -641,7 +853,7 @@ export class MvPrelogFuzzyMatching extends Component {
             all: "All",
             matched: "Matched",
             unmatched: "Unmatched",
-            suggestions: "Fuzzy Suggestions",
+            suggestions: "Suggestions",
             no_suggestion: "No Suggestion",
             removed: "Removed",
             overruns: "Overruns",

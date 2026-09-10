@@ -59,7 +59,7 @@ class PrelogImportEngine:
     }
     _DEFAULT_REQUIRED_FIELDS = []
     _MATCHED = "matched"
-    _CREATED_WITHOUT_SCHEDULE = "created_without_schedule"
+    _CREATED_WITHOUT_SCHEDULE = "unmatched"
     _FAILED_TO_CREATE = "failed_to_create"
     _START_NUMBER_DEFAULT = 6
     _DAY_NUMBERS = {
@@ -237,22 +237,13 @@ class PrelogImportEngine:
         rate = self._safe_optional_value("rate", row.get("rate"), parse_errors)
         schedulelength = self._safe_optional_value("schedulelength", row.get("schedulelength"), parse_errors)
 
-        match_outcome = self._match_schedule(
-            row=row,
-            import_week=import_week,
-            row_index=row_index,
-            airdate=airdate,
-            scheduletime=scheduletime,
-            rate=rate,
-            schedulelength=schedulelength,
-        )
-
         detail_parts = list(parse_errors)
-        if match_outcome["detail"]:
-            detail_parts.append(match_outcome["detail"])
 
         return {
-            "schedule": match_outcome["schedule_id"],
+            # One matcher owns both attachment and suggestions. The background
+            # job creates normalized rows first, then analyses the whole batch
+            # with one schedule query per Program/week.
+            "schedule": False,
             "version": version,
             "isci": self._first_non_empty(
                 normalize_text(row.get("isci")),
@@ -275,7 +266,7 @@ class PrelogImportEngine:
             "batch_id": self.upload_filename or False,
             "import_program": self.program.id,
             "import_week_value": import_week,
-            "import_match_status": match_outcome["status"],
+            "import_match_status": self._CREATED_WITHOUT_SCHEDULE,
             "import_match_detail": "; ".join(part for part in detail_parts if part) or False,
         }
 

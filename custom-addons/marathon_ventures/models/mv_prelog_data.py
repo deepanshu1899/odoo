@@ -7,6 +7,7 @@ import logging
 import re
 from odoo import models, fields, api, _
 from odoo.exceptions import ValidationError
+from odoo.tools.sql import create_index
 
 _logger = logging.getLogger(__name__)
 
@@ -74,8 +75,7 @@ class MvPrelogData(models.Model):
         string='Import Match Status',
         selection=[
             ('matched', 'Matched'),
-            ('created_without_schedule', 'Created Without Schedule'),
-            ('failed_to_create', 'Failed to Create'),
+            ('unmatched', 'Unmatched'),
         ],
         index=True,
     )
@@ -83,6 +83,22 @@ class MvPrelogData(models.Model):
     import_job = fields.Many2one(string='Import Job', comodel_name='mv.prelog_import_job', ondelete='set null', index=True)
     import_program = fields.Many2one(string='Import Program', comodel_name='mv.programs', ondelete='restrict', index=True)
     import_week_value = fields.Date(string='Import Week', index=True)
+    # === Stored Prelog Workbench results ===
+    # Matching is performed by the background import (or the explicit Refresh
+    # action), never while the Workbench is loading. The indexed Many2one makes
+    # Suggestions / No Suggestion ordinary database filters; the JSON keeps the
+    # ranked candidates used by the Review drawer without another match pass.
+    suggested_schedule = fields.Many2one(
+        string='Suggested Schedule', comodel_name='mv.schedules',
+        ondelete='set null', index=True,
+    )
+    possible_schedules = fields.Json(string='Possible Schedules')
+    # Comma-sentinelled issue tokens, for example ',time,length,'. This lets
+    # issue filters remain exact and database-backed.
+    match_flags = fields.Char(string='Match Flags', size=255, index=True)
+    # Workbench display text persisted at analysis time. It intentionally has a
+    # general name so future operational notes are not constrained to matching.
+    info = fields.Char(string='Info', size=255)
     total_000_primary_demo = fields.Integer(string='Total (000) - Primary Demo', compute='_compute_total_000_primary_demo', store=True)  # SF: Total_000_Primary_Demo__c
     total_dollars_earned = fields.Monetary(string='Total Dollars - Earned', currency_field='currency_id', compute='_compute_total_dollars_earned', store=True)  # SF: Total_Dollars_Earned__c
     type = fields.Selection(string='Type', selection=[('media', 'Media'), ('episode', 'Episode')])  # SF: Type__c
@@ -90,6 +106,31 @@ class MvPrelogData(models.Model):
     version = fields.Integer(string='Version')  # SF: Version__c
     week = fields.Date(string='Week', compute='_compute_week', store=True)  # SF: Week__c
     working_log = fields.Many2one(string='Working Log', comodel_name='mv.working_log', ondelete='set null')  # SF: Working_Log__c
+
+    _PRELOG_WORKBENCH_INDEXES = (
+        (
+            'mv_prelog_data_workbench_filter_idx',
+            ['import_program', 'import_week_value', 'version',
+             'import_match_status'],
+            '',
+        ),
+        (
+            'mv_prelog_data_suggestion_idx',
+            ['import_program', 'import_week_value', 'version',
+             'suggested_schedule'],
+            "import_match_status = 'unmatched'",
+        ),
+        (
+            'mv_prelog_data_airdate_order_idx',
+            ['airdate', 'scheduletime', 'id'],
+            '',
+        ),
+    )
+
+    def init(self):
+        super().init()
+        for name, columns, where in self._PRELOG_WORKBENCH_INDEXES:
+            create_index(self.env.cr, name, self._table, columns, where=where)
 
     # === Computed / Roll-Up ===
 
